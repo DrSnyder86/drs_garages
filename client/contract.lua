@@ -1,3 +1,5 @@
+if type(Config.Contract) ~= 'table' or Config.Contract.Enabled ~= true then return end
+
 lib.callback.register('drs_garages:getContractOption', function()
     if cache.vehicle then
         ShowNotification(locale('cant_in_vehicle'), 'error')
@@ -54,7 +56,18 @@ end)
 
 lib.callback.register('drs_garages:getTargetPlayer', function()
     local input = lib.inputDialog(locale('pick_player'), {
-        locale('player_id'), locale('sell_price') 
+        {
+            type = 'number',
+            label = locale('player_id'),
+            required = true,
+            min = 1
+        },
+        {
+            type = 'number',
+            label = locale('sell_price'),
+            required = true,
+            min = 0
+        }
     })
 
     if not input then return end
@@ -92,9 +105,17 @@ lib.callback.register('drs_garages:societyPrompt', function(type)
 end)
 
 RegisterNetEvent('drs_garages:contractAnim', function(message)
+    local duration = tonumber(Config.Contract and Config.Contract.Duration) or 5000
+
+    if duration ~= duration or duration == math.huge or duration == -math.huge then
+        duration = 5000
+    end
+
+    duration = math.min(math.max(math.floor(duration), 250), 60000)
+
     lib.progressBar({
         label = message,
-        duration = Config.Contract.Duration,
+        duration = duration,
         canCancel = false,
         disable = {
             move = true,

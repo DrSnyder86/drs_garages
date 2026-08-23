@@ -1,36 +1,122 @@
 local propertyGarages = {}
 local propertyGarageZones = {}
 local propertyGarageParkZones = {}
+local staticGarageZones = {}
+local impoundZones = {}
 local currentGarageIndex
 local currentGarageMode
+local networkTimeout = 10000
+local propertyRequestGeneration = 0
+
+local function waitForNetworkVehicle(netId, timeout)
+    if type(netId) ~= 'number' or netId <= 0 then return end
+
+    local deadline = GetGameTimer() + (timeout or networkTimeout)
+
+    while not NetworkDoesEntityExistWithNetworkId(netId) and GetGameTimer() < deadline do
+        Wait(0)
+    end
+
+    if not NetworkDoesEntityExistWithNetworkId(netId) then return end
+
+    local vehicle = NetworkGetEntityFromNetworkId(netId)
+    if vehicle == 0 or not DoesEntityExist(vehicle) then return end
+
+    return vehicle
+end
+
+local function applyVehiclePropertiesWhenOwned(vehicle, props)
+    CreateThread(function()
+        local deadline = GetGameTimer() + networkTimeout
+
+        while DoesEntityExist(vehicle) and GetGameTimer() < deadline do
+            if NetworkGetEntityOwner(vehicle) == cache.playerId then
+                lib.setVehicleProperties(vehicle, props)
+                return
+            end
+
+            if GetVehicleNumberPlateText(vehicle):strtrim(' ') == props.plate then
+                return
+            end
+
+            Wait(0)
+        end
+    end)
+end
+
+local function decodeVehicleProperties(vehicle)
+    local encoded = vehicle and (vehicle.mods or vehicle.vehicle)
+    if type(encoded) == 'table' then return encoded end
+    if type(encoded) ~= 'string' or encoded == '' then return end
+
+    local ok, props = pcall(json.decode, encoded)
+    if ok and type(props) == 'table' then return props end
+
+    warn(('[drs_garages] Ignoring invalid vehicle properties for plate %s.'):format(tostring(vehicle.plate)))
+end
+
+local VEHICLE_SETTER_TYPE_EXCEPTIONS = {
+    [`airtug`] = 'automobile',
+    [`avisa`] = 'submarine',
+    [`blimp`] = 'heli',
+    [`blimp2`] = 'heli',
+    [`blimp3`] = 'heli',
+    [`caddy`] = 'automobile',
+    [`caddy2`] = 'automobile',
+    [`caddy3`] = 'automobile',
+    [`chimera`] = 'automobile',
+    [`docktug`] = 'automobile',
+    [`forklift`] = 'automobile',
+    [`kosatka`] = 'submarine',
+    [`mower`] = 'automobile',
+    [`policeb`] = 'bike',
+    [`ripley`] = 'automobile',
+    [`rrocket`] = 'automobile',
+    [`sadler`] = 'automobile',
+    [`sadler2`] = 'automobile',
+    [`scrap`] = 'automobile',
+    [`slamtruck`] = 'automobile',
+    [`stryder`] = 'automobile',
+    [`submersible`] = 'submarine',
+    [`submersible2`] = 'submarine',
+    [`thruster`] = 'heli',
+    [`towtruck`] = 'automobile',
+    [`towtruck2`] = 'automobile',
+    [`tractor`] = 'automobile',
+    [`tractor2`] = 'automobile',
+    [`tractor3`] = 'automobile',
+    [`trailersmall2`] = 'trailer',
+    [`utillitruck`] = 'automobile',
+    [`utillitruck2`] = 'automobile',
+    [`utillitruck3`] = 'automobile'
+}
+
+local VEHICLE_CLASS_TO_SETTER_TYPE = {
+    [8] = 'bike',
+    [11] = 'trailer',
+    [13] = 'bike',
+    [14] = 'boat',
+    [15] = 'heli',
+    [16] = 'plane',
+    [21] = 'train'
+}
+
+local function isSubmarineModel(model)
+    return VEHICLE_SETTER_TYPE_EXCEPTIONS[model] == 'submarine'
+        or type(IsThisModelASubmarine) == 'function' and IsThisModelASubmarine(model)
+        or type(IsThisModelASubmersible) == 'function' and IsThisModelASubmersible(model)
+end
 
 local function getVehicleSpawnType(model)
-    if IsThisModelABike(model) then
-        return 'bike'
-    end
+    local exception = VEHICLE_SETTER_TYPE_EXCEPTIONS[model]
+    if exception then return exception end
 
-    -- Not really sure if quadbike is considered an automobile or a bike
-    if IsThisModelACar(model) or IsThisModelAQuadbike(model) then
-        return 'automobile'
-    end
-
-    if IsThisModelABoat(model) or IsThisModelAJetski(model) then
-        return 'boat'
-    end
-
-    if IsThisModelAPlane(model) then
-        return 'plane'
-    end
-
-    if IsThisModelAHeli(model) then
-        return 'heli'
-    end
-
-    return 'automobile'
+    local vehicleClass = GetVehicleClassFromName(model)
+    return VEHICLE_CLASS_TO_SETTER_TYPE[vehicleClass] or 'automobile'
 end
 
 local function getVehicleGarageType(model)
-    if IsThisModelABoat(model) or IsThisModelAJetski(model) then
+    if IsThisModelABoat(model) or IsThisModelAJetski(model) or isSubmarineModel(model) then
         return 'boat'
     end
 
@@ -55,29 +141,21 @@ end
 
 -- Taken from ox_lib, but higher timeout value and modified
 RegisterNetEvent('drs_garages:setVehicleProperties', function(netId, data)
-    local timeout = 10000
+    if type(data) ~= 'table' then return end
 
-    while not NetworkDoesEntityExistWithNetworkId(netId) and timeout > 0 do
-        Wait(0)
-        timeout -= 1
-    end
+    local vehicle = waitForNetworkVehicle(netId)
+    if not vehicle or NetworkGetEntityOwner(vehicle) ~= cache.playerId then return end
 
-    if timeout > 0 then
-        local vehicle = NetToVeh(netId)
-
-        if NetworkGetEntityOwner(vehicle) ~= cache.playerId then return end
-
-        lib.setVehicleProperties(vehicle, data)
-    end
+    lib.setVehicleProperties(vehicle, data)
 end)
 
 function SpawnVehicle(args)
     ---@type integer, VehicleProperties
-    local index, props = args.index, args.props
+    local index, props = args and args.index, args and args.props
     
     local garage = getGarage(index)
-    if not garage then
-        ShowNotification(('Invalid garage index: %s'):format(tostring(index)), 'error')
+    if not garage or type(props) ~= 'table' or not props.model or not props.plate then
+        ShowNotification(locale('invalid_garage'), 'error')
         return
     end
     
@@ -88,7 +166,7 @@ function SpawnVehicle(args)
 
     lib.progressBar({
         duration = 3000,
-        label = 'Retrieving vehicle...',
+        label = locale('retrieving_vehicle'),
         useWhileDead = false,
         canCancel = false,
         disable = {
@@ -102,28 +180,20 @@ function SpawnVehicle(args)
     local type = getVehicleSpawnType(props.model)
     local netId = lib.callback.await('drs_garages:takeOutVehicle', false, index, props.plate, type, args.society)
     if not netId then
-        ShowNotification('Could not retrieve vehicle. Invalid garage or vehicle data.', 'error')
+        SetModelAsNoLongerNeeded(props.model)
+        ShowNotification(locale('vehicle_retrieve_failed'), 'error')
         return
     end
-    
-    while not NetworkDoesEntityExistWithNetworkId(netId) do Wait(0) end
 
-    local vehicle = NetworkGetEntityFromNetworkId(netId)
+    local vehicle = waitForNetworkVehicle(netId)
+    SetModelAsNoLongerNeeded(props.model)
 
-    CreateThread(function()
-        while true do
-            if NetworkGetEntityOwner(vehicle) == cache.playerId then
-                lib.setVehicleProperties(vehicle, props)
-                return
-            end
+    if not vehicle then
+        ShowNotification(locale('vehicle_network_timeout'), 'error')
+        return
+    end
 
-            if GetVehicleNumberPlateText(vehicle) == props.plate then
-                return
-            end
-
-            Wait(0)
-        end
-    end)
+    applyVehiclePropertiesWhenOwned(vehicle, props)
 
     TaskTurnPedToFaceCoord(
         cache.ped,
@@ -160,7 +230,7 @@ function SpawnVehicle(args)
     SetVehicleFuel(vehicle, props.fuelLevel or 100.0)
     SetVehicleOwner(props.plate, vehicle)
 
-    ShowNotification('Vehicle retrieved', 'success')
+    ShowNotification(locale('vehicle_retrieved'), 'success')
 end
 
 function GetVehicleLabel(model)
@@ -207,13 +277,13 @@ end
 local function openGarageVehicles(args)
     local index, society = args.index, args.society
     if not index then
-        ShowNotification('Invalid garage index.', 'error')
+        ShowNotification(locale('invalid_garage'), 'error')
         return
     end
 
     local garage = getGarage(index)
     if not garage then
-        ShowNotification(('Invalid garage index: %s'):format(tostring(index)), 'error')
+        ShowNotification(locale('invalid_garage'), 'error')
         return
     end
 
@@ -224,7 +294,7 @@ local function openGarageVehicles(args)
 
     for _, vehicle in ipairs(vehicles) do
         ---@type VehicleProperties
-        local props = json.decode(vehicle.mods or vehicle.vehicle)
+        local props = decodeVehicleProperties(vehicle)
 
         if props?.model and getVehicleGarageType(props.model) == garage.Type then
             local class = GetVehicleClassFromName(GetDisplayNameFromVehicleModel(props.model))
@@ -246,7 +316,7 @@ local function openGarageVehicles(args)
                 args = { index = index, props = props, society = society },
                 onSelect = vehicle.state == 'in_garage' and SpawnVehicle or function()
                     if vehicle.state == 'out_garage' then
-                        local coords = lib.callback.await('drs_garages:getVehicleCoords', false, vehicle.plate)
+                        local coords = lib.callback.await('drs_garages:getVehicleCoords', false, vehicle.plate, society)
                         if coords then
                             SetNewWaypoint(coords.x, coords.y)
                             ShowNotification(locale('out_garage_message'))
@@ -281,7 +351,7 @@ end
 local function openGarage(index)
     local garage = getGarage(index)
     if not garage then
-        ShowNotification(('Invalid garage index: %s'):format(tostring(index)), 'error')
+        ShowNotification(locale('invalid_garage'), 'error')
         return
     end
 
@@ -324,7 +394,7 @@ local function saveVehicle(index, vehicle)
     end
 
     if not index or not getGarage(index) then
-        ShowNotification('Invalid garage index.', 'error')
+        ShowNotification(locale('invalid_garage'), 'error')
         return
     end
 
@@ -339,10 +409,12 @@ local function saveVehicle(index, vehicle)
     if not props then return end
 
     props.plate = props.plate:strtrim(' ') -- Trim whitespace
-    props.fuelLevel = GetVehicleFuel(vehicle)
     local netId = NetworkGetNetworkIdFromEntity(vehicle)
     local type = getVehicleSpawnType(props.model)
-    local result = lib.callback.await('drs_garages:saveVehicle', false, props, netId, index, type)
+    local result = lib.callback.await('drs_garages:saveVehicle', false, {
+        plate = props.plate,
+        model = props.model
+    }, netId, index, type)
     
     if result then
         if cache.vehicle then
@@ -358,45 +430,36 @@ end
 
 local function retrieveVehicle(args)
     ---@type integer, VehicleProperties
-    local index, props = args.index, args.props
-    
-    lib.requestModel(props.model)
-    local type = getVehicleSpawnType(props.model)
-    if not index then
-        ShowNotification('Invalid impound index.', 'error')
+    local index, props = args and args.index, args and args.props
+
+    if not index or not Config.Impounds[index] or type(props) ~= 'table' or not props.model or not props.plate then
+        ShowNotification(locale('invalid_impound'), 'error')
         return
     end
+
+    lib.requestModel(props.model)
+    local type = getVehicleSpawnType(props.model)
 
     local success, netId = lib.callback.await('drs_garages:retrieveVehicle', false, index, props.plate, type, args.society)
 
     if not success or not netId then
+        SetModelAsNoLongerNeeded(props.model)
         ShowNotification(locale('not_enough_money'), 'error')
         return
     end
 
-    while not NetworkDoesEntityExistWithNetworkId(netId) do Wait(0) end
+    local vehicle = waitForNetworkVehicle(netId)
+    SetModelAsNoLongerNeeded(props.model)
 
-    local vehicle = NetworkGetEntityFromNetworkId(netId)
+    if not vehicle then
+        ShowNotification(locale('vehicle_network_timeout'), 'error')
+        return
+    end
 
-    CreateThread(function()
-        while true do
-            if NetworkGetEntityOwner(vehicle) == cache.playerId then
-                lib.setVehicleProperties(vehicle, props)
-                return
-            end
+    applyVehiclePropertiesWhenOwned(vehicle, props)
 
-            local plate = GetVehicleNumberPlateText(vehicle)
-
-            if plate == props.plate then
-                return
-            end
-
-            Wait(0)
-        end
-    end)
-
-    -- The player doesn't get warped in the vehicle sometimes, repeat it and timeout after 2000 attempts
-    for _ = 1, 2000 do
+    local warpDeadline = GetGameTimer() + 5000
+    while GetGameTimer() < warpDeadline do
         TaskWarpPedIntoVehicle(cache.ped, vehicle, -1)
         
         if GetVehiclePedIsIn(cache.ped, false) == vehicle then
@@ -413,13 +476,13 @@ end
 local function openImpoundVehicles(args)
     local index, society = args.index, args.society
     if not index then
-        ShowNotification('Invalid impound index.', 'error')
+        ShowNotification(locale('invalid_impound'), 'error')
         return
     end
 
     local impound = Config.Impounds[index]
     if not impound then
-        ShowNotification(('Invalid impound index: %s'):format(tostring(index)), 'error')
+        ShowNotification(locale('invalid_impound'), 'error')
         return
     end
 
@@ -430,7 +493,7 @@ local function openImpoundVehicles(args)
 
     for _, vehicle in ipairs(vehicles) do
         ---@type VehicleProperties
-        local props = json.decode(vehicle.mods or vehicle.vehicle)
+        local props = decodeVehicleProperties(vehicle)
 
         if props?.model and getVehicleGarageType(props.model) == impound.Type then
             local class = GetVehicleClassFromName(GetDisplayNameFromVehicleModel(props.model))
@@ -573,10 +636,13 @@ local function clearGaragePrompt(index, mode)
 end
 
 local function createGaragePoint(index, data, trackZone)
-    if (not Config.Target or not data.PedPosition) and data.Position then
+    local targetAvailable = Utils.isTargetEnabled() and data.PedPosition and Utils.isTargetAvailable(true)
+    local interactionPosition = data.Position or (data.PedPosition and data.PedPosition.xyz)
+
+    if not targetAvailable and interactionPosition then
         local radius = data.Property and (Config.PropertyGarageDistance or 3.0) or Config.MaxDistance
         local zone = lib.zones.sphere({
-            coords = data.Position,
+            coords = interactionPosition,
             radius = radius,
             onEnter = function()
                 if data.Jobs and not Utils.hasJobs(data.Jobs) then return end
@@ -592,6 +658,8 @@ local function createGaragePoint(index, data, trackZone)
 
         if trackZone then
             propertyGarageZones[index] = zone
+        else
+            staticGarageZones[#staticGarageZones + 1] = zone
         end
 
         if trackZone and data.Property and data.SpawnPosition then
@@ -612,7 +680,7 @@ local function createGaragePoint(index, data, trackZone)
 
             propertyGarageParkZones[index] = parkZone
         end
-    elseif (Config.Target or not data.Position) and data.PedPosition then
+    elseif targetAvailable then
         if not data.Model then
             warn(('Skipping garage - missing Model, index: %s'):format(index))
             return
@@ -705,7 +773,20 @@ RegisterNetEvent('drs_garages:client:registerPropertyGarage', registerPropertyGa
 RegisterNetEvent('drs_garages:client:removePropertyGarage', removePropertyGarage)
 
 local function requestPropertyGarages()
+    propertyRequestGeneration += 1
+    local generation = propertyRequestGeneration
     local garages = lib.callback.await('drs_garages:getPropertyGarages', false) or {}
+
+    if generation ~= propertyRequestGeneration then return end
+
+    local staleIndexes = {}
+    for index in pairs(propertyGarages) do
+        if garages[index] == nil then staleIndexes[#staleIndexes + 1] = index end
+    end
+
+    for i = 1, #staleIndexes do
+        removePropertyGarage(staleIndexes[i])
+    end
 
     for index, data in pairs(garages) do
         registerPropertyGarage(index, data)
@@ -722,20 +803,33 @@ RegisterNetEvent('QBCore:Client:OnPlayerLoaded', function()
     requestPropertyGarages()
 end)
 
-RegisterNetEvent('qbx_core:client:playerLoggedOut', function()
+local function clearPropertyGaragesOnLogout()
+    propertyRequestGeneration += 1
+
+    local indexes = {}
     for index in pairs(propertyGarages) do
-        removePropertyGarage(index)
+        indexes[#indexes + 1] = index
     end
-end)
+
+    for i = 1, #indexes do
+        removePropertyGarage(indexes[i])
+    end
+end
+
+RegisterNetEvent('QBCore:Client:OnPlayerUnload', clearPropertyGaragesOnLogout)
+RegisterNetEvent('qbx_core:client:playerLoggedOut', clearPropertyGaragesOnLogout)
 
 for index, data in ipairs(Config.Garages) do
     createGaragePoint(index, data)
 end
 
 for index, data in ipairs(Config.Impounds) do
-    if (not Config.Target or not data.PedPosition) and data.Position then
-        lib.zones.sphere({
-            coords = data.Position,
+    local targetAvailable = Utils.isTargetEnabled() and data.PedPosition and Utils.isTargetAvailable(true)
+    local interactionPosition = data.Position or (data.PedPosition and data.PedPosition.xyz)
+
+    if not targetAvailable and interactionPosition then
+        impoundZones[#impoundZones + 1] = lib.zones.sphere({
+            coords = interactionPosition,
             radius = Config.MaxDistance,
             onEnter = function()
                 if data.Jobs and not Utils.hasJobs(data.Jobs) then return end
@@ -750,7 +844,7 @@ for index, data in ipairs(Config.Impounds) do
                 Binds.first.removeListener('impound')
             end
         })
-    elseif (Config.Target or not data.Position) and data.PedPosition then
+    elseif targetAvailable then
         if not data.Model then
             warn(('Skipping impound - missing Model, index: %s'):format(index))
         else
@@ -768,3 +862,29 @@ for index, data in ipairs(Config.Impounds) do
         warn(('Skipping impound - missing Position or PedPosition, index: %s'):format(index))
     end
 end
+
+AddEventHandler('onResourceStop', function(resource)
+    if resource ~= GetCurrentResourceName() then return end
+
+    HideUI()
+    Binds.first.removeListener('garage')
+    Binds.second.removeListener('garage')
+    Binds.first.removeListener('impound')
+
+    for i = 1, #staticGarageZones do
+        staticGarageZones[i]:remove()
+    end
+
+    for i = 1, #impoundZones do
+        impoundZones[i]:remove()
+    end
+
+    local propertyIndexes = {}
+    for index in pairs(propertyGarages) do
+        propertyIndexes[#propertyIndexes + 1] = index
+    end
+
+    for i = 1, #propertyIndexes do
+        removePropertyGarage(propertyIndexes[i])
+    end
+end)

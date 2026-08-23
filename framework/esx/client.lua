@@ -30,7 +30,8 @@ Framework.getJob = function()
         return false
     end
 
-    return sharedObject.playerData.job.name
+    local playerData = sharedObject.GetPlayerData()
+    return playerData and playerData.job and playerData.job.name or false
 end
 
 Framework.hasItem = function(name)

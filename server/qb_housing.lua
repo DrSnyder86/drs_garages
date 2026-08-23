@@ -216,9 +216,11 @@ local function awaitDatabaseSetup()
 
     local databaseApi = rawget(_G, 'DRSGaragesDatabase')
 
-    -- Older builds have no setup gate. oxmysql's await query remains the fallback.
     if type(databaseApi) ~= 'table' or type(databaseApi.awaitReady) ~= 'function' then
-        return true
+        databaseGateResolved = true
+        databaseGateSucceeded = false
+        logLimited('database-gate', 'Housing sync is paused because the DRS database readiness API is unavailable.')
+        return false
     end
 
     local callOk, ready, detail = pcall(databaseApi.awaitReady)

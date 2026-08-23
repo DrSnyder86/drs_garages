@@ -62,23 +62,33 @@ function player:hasOneOfGroups(groups)
 end
 
 function player:addItem(name, count)
+    local before = self:getItemCount(name)
+    local result
+
     if ox_inventory then
-        return exports.ox_inventory:AddItem(self.source, name, count)
+        result = exports.ox_inventory:AddItem(self.source, name, count)
+    elseif self.QBXPlayer.Functions and self.QBXPlayer.Functions.AddItem then
+        result = self.QBXPlayer.Functions.AddItem(name, count)
     end
 
-    if self.QBXPlayer.Functions and self.QBXPlayer.Functions.AddItem then
-        return self.QBXPlayer.Functions.AddItem(name, count)
-    end
+    if result ~= nil then return result == true end
+    return self:getItemCount(name) >= before + count
 end
 
 function player:removeItem(name, count)
+    local before = self:getItemCount(name)
+    if before < count then return false end
+
+    local result
+
     if ox_inventory then
-        return exports.ox_inventory:RemoveItem(self.source, name, count)
+        result = exports.ox_inventory:RemoveItem(self.source, name, count)
+    elseif self.QBXPlayer.Functions and self.QBXPlayer.Functions.RemoveItem then
+        result = self.QBXPlayer.Functions.RemoveItem(name, count)
     end
 
-    if self.QBXPlayer.Functions and self.QBXPlayer.Functions.RemoveItem then
-        return self.QBXPlayer.Functions.RemoveItem(name, count)
-    end
+    if result ~= nil then return result == true end
+    return self:getItemCount(name) <= before - count
 end
 
 function player:canCarryItem(name, count)
@@ -111,10 +121,12 @@ function player:getAccountMoney(account)
 end
 
 function player:addAccountMoney(account, amount)
+    if amount == 0 then return true end
     return exports.qbx_core:AddMoney(self.source, normalizeAccount(account), amount, 'drs_garages')
 end
 
 function player:removeAccountMoney(account, amount)
+    if amount == 0 then return true end
     return exports.qbx_core:RemoveMoney(self.source, normalizeAccount(account), amount, 'drs_garages')
 end
 
@@ -122,8 +134,25 @@ function player:getJob()
     return self.PlayerData.job and self.PlayerData.job.name or 'unemployed'
 end
 
+function player:isJobBoss()
+    local job = self.PlayerData.job
+    return job and job.isboss == true or false
+end
+
 function player:getIdentifier()
     return self.PlayerData.citizenid
+end
+
+function player:getLicense()
+    if self.PlayerData.license then
+        return self.PlayerData.license
+    end
+
+    for _, identifier in ipairs(GetPlayerIdentifiers(self.source)) do
+        if identifier:sub(1, 8) == 'license:' then
+            return identifier
+        end
+    end
 end
 
 function player:getFirstName()

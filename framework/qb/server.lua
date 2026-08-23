@@ -1,4 +1,6 @@
-if GetResourceState('qb-core') ~= 'started' then return end
+-- qbx_core advertises a qb-core compatibility alias. Leave Qbox exclusively to
+-- the native Qbox adapter instead of initializing both adapters in sequence.
+if GetResourceState('qbx_core') == 'started' or GetResourceState('qb-core') ~= 'started' then return end
 
 Framework = { name = 'qb-core' }
 local sharedObject = exports['qb-core']:GetCoreObject()
@@ -43,11 +45,21 @@ function player:hasOneOfGroups(groups)
 end
 
 function player:addItem(name, count)
-    self.QBPlayer.Functions.AddItem(name, count)
+    local before = self:getItemCount(name)
+    local result = self.QBPlayer.Functions.AddItem(name, count)
+
+    if result ~= nil then return result == true end
+    return self:getItemCount(name) >= before + count
 end
 
 function player:removeItem(name, count)
-    self.QBPlayer.Functions.RemoveItem(name, count)
+    local before = self:getItemCount(name)
+    if before < count then return false end
+
+    local result = self.QBPlayer.Functions.RemoveItem(name, count)
+    if result ~= nil then return result == true end
+
+    return self:getItemCount(name) <= before - count
 end
 
 function player:canCarryItem(name, count)
@@ -67,27 +79,64 @@ function player:getAccountMoney(account)
 end
 
 function player:addAccountMoney(account, amount)
+    if amount == 0 then return true end
+
+    local normalized = account == 'money' and 'cash' or account
+    local before = self.QBPlayer.Functions.GetMoney(normalized) or 0
+    local result
+
     if account == 'money' then
-        self.QBPlayer.Functions.AddMoney('cash', amount)
+        result = self.QBPlayer.Functions.AddMoney('cash', amount, 'drs_garages')
     else
-        self.QBPlayer.Functions.AddMoney(account, amount)
+        result = self.QBPlayer.Functions.AddMoney(account, amount, 'drs_garages')
     end
+
+    if result ~= nil then return result == true end
+    return (self.QBPlayer.Functions.GetMoney(normalized) or 0) >= before + amount
 end
 
 function player:removeAccountMoney(account, amount)
+    if amount == 0 then return true end
+
+    local normalized = account == 'money' and 'cash' or account
+    local before = self.QBPlayer.Functions.GetMoney(normalized) or 0
+    if before < amount then return false end
+
+    local result
+
     if account == 'money' then
-        self.QBPlayer.Functions.RemoveMoney('cash', amount)
+        result = self.QBPlayer.Functions.RemoveMoney('cash', amount, 'drs_garages')
     else
-        self.QBPlayer.Functions.RemoveMoney(account, amount)
+        result = self.QBPlayer.Functions.RemoveMoney(account, amount, 'drs_garages')
     end
+
+    if result ~= nil then return result == true end
+    return (self.QBPlayer.Functions.GetMoney(normalized) or 0) <= before - amount
 end
 
 function player:getJob()
     return self.QBPlayer.PlayerData.job.name
 end
 
+function player:isJobBoss()
+    local job = self.QBPlayer.PlayerData.job
+    return job and job.isboss == true or false
+end
+
 function player:getIdentifier()       
     return self.QBPlayer.PlayerData.citizenid
+end
+
+function player:getLicense()
+    if self.QBPlayer.PlayerData.license then
+        return self.QBPlayer.PlayerData.license
+    end
+
+    for _, identifier in ipairs(GetPlayerIdentifiers(self.source)) do
+        if identifier:sub(1, 8) == 'license:' then
+            return identifier
+        end
+    end
 end
 
 function player:getFirstName()

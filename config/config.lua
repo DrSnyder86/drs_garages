@@ -3,9 +3,27 @@ Config.MaxDistance = 10.0 -- Max interact distance
 Config.MaxVehiclePropsBytes = 64 * 1024 -- Maximum encoded vehicle-properties payload accepted when parking (64 KiB).
 Config.PropertyGarageDistance = 3.0 -- Property garage TextUI interact distance
 Config.PropertyGarageParkingDistance = 3.0 -- Property garage vehicle parking TextUI distance
-Config.UseKeySystem = true -- Qbox keys are issued server-side; customize other systems in config/cl_edit.lua
+Config.UseKeySystem = true -- Qbox and current qb-vehiclekeys keys are issued by validated server flows.
 Config.SpawnpointCheck = true -- Checks if the vehicle spawnpoint is empty before spawning it.
 Config.AutoRespawn = true -- True == auto respawn cars that are outside into your garage on script restart, false == does not put them into your garage and players have to go to the impound
+
+-- Vehicle storage visibility. `global` preserves the original behavior, `garage`
+-- keeps vehicles at their exact public/property garage, and `property` keeps the
+-- public network global while isolating each property garage.
+Config.Storage = {
+    Mode = 'global', -- global, garage, property
+    DefaultGarages = {
+        car = 'pillboxgarage',
+        boat = 'lsymcboathouse',
+        air = 'airporthangar'
+    },
+    -- In garage mode, recover NULL/empty/stale garage values at the type's
+    -- configured default instead of leaving legacy vehicles inaccessible.
+    RecoverUnassigned = true,
+    -- Recover vehicles from deleted/sold properties or after keyholder access is
+    -- removed. Recovery is virtual until the vehicle is parked again.
+    RecoverInaccessibleProperties = true
+}
 
 -- Idempotent startup installer. It only adds missing DRS compatibility columns/indexes
 -- to an existing QB/Qbox player_vehicles table; it never drops or recreates data.
@@ -27,7 +45,11 @@ Config.Integrations = {
     }
 }
 
--- The global setting for target however you can still combine target/TextUI by omitting Position or PedPosition in garage/impound data
+-- true/`auto` detects ox_target, qb-target, then qtarget. If none is running,
+-- interactions fall back to ox_lib TextUI at Position or PedPosition.
+-- You can also use false, a provider name, or { Enabled = true, Resource = 'ox_target' }.
+-- Provider selection runs when drs_garages starts. Restart drs_garages after
+-- starting, stopping, removing, or switching a target provider.
 Config.Target = true
 
 ---@alias VehicleType string
@@ -92,6 +114,8 @@ Config.Blips = {
 ---@field Model? number | string Needs to be defined if PedPosition is defined.
 ---@field SpawnPosition vector4 The vehicle spawn position.
 ---@field Jobs? string | string[] Optionally limit to jobs.
+---@field Garage? string Stable database storage id. Coordinate-derived when omitted.
+---@field Id? string Alias for Garage.
 
 ---@class GarageData : LocationData
 ---@field Interior string? The interior name.
@@ -101,6 +125,7 @@ Config.Garages = {
     {
         Visible = true,
         Type = 'car',
+        Garage = 'pillboxgarage',
         Position = vector3(220.1418, -800.1686, 30.7227),
         PedPosition = vector4(215.4677, -808.5453, 30.7597, 248.1795),
         Model = `s_m_m_armoured_01`,
@@ -536,7 +561,9 @@ Config.GarageInteriors = {
     }
 }
 
-Config.ImpoundPrice = 1000 --Price to return your vehicle.
+-- Paid redemption is opt-in. Framework cash and vehicle-state changes are not
+-- one crash-durable transaction, so a process crash can require manual refund.
+Config.ImpoundPrice = 0
 
 ---@class ImpoundData : LocationData
 
@@ -569,6 +596,14 @@ Config.Impounds = {
 }
 
 Config.Contract = {
+    -- Opt-in: framework money, inventory, and ownership APIs do not provide one
+    -- atomic transaction. A process crash during a transfer can require manual
+    -- reconciliation even though normal runtime failures are compensated.
+    Enabled = false,
     Duration = 5000, -- The animation duration
-    Item = 'contract' -- The item name
+    Item = 'contract', -- The item name
+    VehicleDistance = 5.0, -- Maximum vehicle distance for a server-authorized contract (plus the 2m network tolerance).
+    MinimumPrice = 0,
+    MaximumPrice = 100000000,
+    SocietyWithdrawalRequiresBoss = true -- Only the current job boss can privatize a society vehicle.
 }

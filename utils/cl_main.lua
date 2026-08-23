@@ -30,69 +30,299 @@ local scenarios = {
     'WORLD_HUMAN_CLIPBOARD',
 }
 
-local count = 0
+local targetProviders <const> = { 'ox_target', 'qb-target', 'qtarget' }
+local supportedTargetProviders <const> = {
+    ox_target = true,
+    ['qb-target'] = true,
+    qtarget = true
+}
+local managedPedPoints = {}
+local targetWarningShown = false
+local targetZoneSequence = 0
 
-function Utils.createPed(coords, model, options)
-    if not IsModelValid(model) then
-        error('Invalid ped model: %s', model)
+local function targetWarning(message)
+    if targetWarningShown then return end
+
+    targetWarningShown = true
+    print(('[drs_garages] WARNING: %s'):format(message))
+end
+
+local function normalizedTargetName(value)
+    if type(value) ~= 'string' then return end
+
+    value = value:match('^%s*(.-)%s*$'):lower()
+    if value == '' then return end
+    return value
+end
+
+local function getTargetConfiguration()
+    local targetConfig = Config and Config.Target
+    local enabled = targetConfig ~= false
+    local explicitProvider
+
+    if type(targetConfig) == 'string' then
+        local normalized = normalizedTargetName(targetConfig)
+        enabled = normalized ~= 'off' and normalized ~= 'none' and normalized ~= 'textui'
+
+        if enabled and normalized ~= 'auto' then
+            explicitProvider = normalized
+        end
+    elseif type(targetConfig) == 'table' then
+        enabled = targetConfig.Enabled ~= false
+        explicitProvider = targetConfig.Resource or targetConfig.Provider
     end
 
-    -- Convert action to qtarget
-    if options then
-        for _, option in pairs(options) do
-            if option.onSelect then
-                count += 1
-                local event = ('options_%p_%s'):format(option.onSelect, count) -- Create unique name
-                ---@type function
-                local onSelect = option.onSelect
-                AddEventHandler(event, function()
-                    onSelect(option.args)
-                end)
-                option.event = event
-                option.onSelect = nil
+    if Config then
+        explicitProvider = Config.TargetResource or Config.TargetProvider or explicitProvider
+    end
+
+    explicitProvider = normalizedTargetName(explicitProvider)
+    if explicitProvider == 'auto' then explicitProvider = nil end
+
+    return enabled, explicitProvider
+end
+
+
+local function getTargetProvider(warnIfMissing)
+    local enabled, explicitProvider = getTargetConfiguration()
+    if not enabled then return end
+
+    if explicitProvider then
+        if not supportedTargetProviders[explicitProvider] then
+            if warnIfMissing then
+                targetWarning(('the configured target provider %s is unsupported. Use ox_target, qb-target, or qtarget. Falling back to TextUI interactions.'):format(explicitProvider))
             end
 
-            if option.icon then
-                option.icon = ('fa-solid fa-%s'):format(option.icon)
-            end
+            return
+        end
+
+        if GetResourceState(explicitProvider) == 'started' then
+            return explicitProvider
+        end
+
+        if warnIfMissing then
+            targetWarning(('the configured target provider %s is not started. Falling back to TextUI interactions.'):format(explicitProvider))
+        end
+
+        return
+    end
+
+    for i = 1, #targetProviders do
+        local resource = targetProviders[i]
+
+        if GetResourceState(resource) == 'started' then
+            return resource
         end
     end
 
-    local ped, id
-    lib.points.new({
+    if warnIfMissing then
+        targetWarning('Config.Target is enabled, but ox_target, qb-target, and qtarget are unavailable. Falling back to TextUI interactions.')
+    end
+end
+
+function Utils.isTargetEnabled()
+    return getTargetConfiguration()
+end
+
+---Returns whether a supported target resource is currently available.
+---@param warnIfMissing? boolean
+---@return boolean available
+---@return string? provider
+function Utils.isTargetAvailable(warnIfMissing)
+    local provider = getTargetProvider(warnIfMissing)
+
+    return provider ~= nil, provider
+end
+
+exports('IsTargetAvailable', function()
+    return Utils.isTargetAvailable(false)
+end)
+
+exports('IsTargetEnabled', function()
+    return Utils.isTargetEnabled()
+end)
+
+local function targetIcon(icon)
+    if type(icon) ~= 'string' or icon == '' then return icon end
+    if icon:find('fa%-', 1, false) then return icon end
+
+    return ('fa-solid fa-%s'):format(icon)
+end
+
+local function qbTargetJobs(jobs)
+    if type(jobs) ~= 'table' then return jobs end
+
+    local result = {}
+    for key, value in pairs(jobs) do
+        local job = type(key) == 'number' and value or key
+        local grade = type(key) == 'number' and 0 or tonumber(value) or 0
+
+        if type(job) == 'string' and job ~= '' then
+            result[job] = grade
+        end
+    end
+
+    return result
+end
+
+local function buildOxTargetOptions(zoneName, options)
+    local result = {}
+
+    for index, option in ipairs(options or {}) do
+        local selectedOption = option
+
+        result[index] = {
+            name = ('%s_%s'):format(zoneName, index),
+            label = selectedOption.label,
+            icon = targetIcon(selectedOption.icon),
+            groups = selectedOption.job,
+            distance = selectedOption.distance or 2.0,
+            canInteract = selectedOption.canInteract,
+            onSelect = function()
+                if selectedOption.onSelect then
+                    selectedOption.onSelect(selectedOption.args)
+                end
+            end
+        }
+    end
+
+    return result
+end
+
+local function buildQbTargetOptions(options)
+    local result = {}
+
+    for index, option in ipairs(options or {}) do
+        local selectedOption = option
+
+        result[index] = {
+            label = selectedOption.label,
+            icon = targetIcon(selectedOption.icon),
+            job = qbTargetJobs(selectedOption.job),
+            canInteract = selectedOption.canInteract,
+            action = function()
+                if selectedOption.onSelect then
+                    selectedOption.onSelect(selectedOption.args)
+                end
+            end
+        }
+    end
+
+    return result
+end
+
+local function addTargetZone(provider, zoneName, coords, options)
+    if provider == 'ox_target' then
+        return exports.ox_target:addSphereZone({
+            name = zoneName,
+            coords = coords.xyz,
+            radius = 0.75,
+            debug = false,
+            options = buildOxTargetOptions(zoneName, options)
+        })
+    end
+
+    exports[provider]:AddCircleZone(zoneName, coords.xyz, 0.75, {
+        name = zoneName,
+        debugPoly = false
+    }, {
+        options = buildQbTargetOptions(options),
+        distance = 2.0
+    })
+
+    return zoneName
+end
+
+local function removeTargetZone(provider, zoneId)
+    if not provider or not zoneId or GetResourceState(provider) ~= 'started' then return end
+
+    if provider == 'ox_target' then
+        exports.ox_target:removeZone(zoneId)
+    else
+        exports[provider]:RemoveZone(zoneId)
+    end
+end
+
+local function cleanupPedPoint(record)
+    if record.zoneId then
+        pcall(removeTargetZone, record.provider, record.zoneId)
+        record.zoneId = nil
+        record.provider = nil
+    end
+
+    if record.ped and DoesEntityExist(record.ped) then
+        DeleteEntity(record.ped)
+    end
+
+    record.ped = nil
+end
+
+function Utils.createPed(coords, model, options)
+    if not IsModelValid(model) then
+        error(('Invalid ped model: %s'):format(tostring(model)))
+    end
+
+    targetZoneSequence += 1
+    local record = {
+        zoneName = ('drs_garage_ped_%s'):format(targetZoneSequence)
+    }
+
+    record.point = lib.points.new({
         coords = coords.xyz,
         distance = 100.0,
         onEnter = function()
             lib.requestModel(model)
-            ped = CreatePed(4, model, coords.x, coords.y, coords.z - 1.0, coords.w, false, true)
-            SetEntityInvincible(ped, true)
-            FreezeEntityPosition(ped, true)
-            SetBlockingOfNonTemporaryEvents(ped, true)
-            TaskStartScenarioInPlace(ped, Utils.randomFromTable(scenarios))
-            if options then
-                id = ('garage_ped_%s'):format(ped)
+            record.ped = CreatePed(4, model, coords.x, coords.y, coords.z - 1.0, coords.w, false, true)
 
-                -- No need to add support for ox_target/qb-target, because this export is intercompatible
-                exports.qtarget:AddCircleZone(id, coords.xyz, 0.75, {
-                    name = id,
-                    debugPoly = false
-                }, {
-                    options = options
-                })
+            if not record.ped or record.ped == 0 or not DoesEntityExist(record.ped) then
+                targetWarning(('could not create the interaction ped for zone %s.'):format(record.zoneName))
+                return
+            end
+
+            SetEntityInvincible(record.ped, true)
+            FreezeEntityPosition(record.ped, true)
+            SetBlockingOfNonTemporaryEvents(record.ped, true)
+            local scenario = Utils.randomFromTable(scenarios)
+            TaskStartScenarioInPlace(record.ped, scenario, -1, true)
+
+            if options then
+                local available, provider = Utils.isTargetAvailable(true)
+                if not available then return end
+
+                local ok, zoneId = pcall(addTargetZone, provider, record.zoneName, coords, options)
+                if not ok or not zoneId then
+                    targetWarning(('the %s target adapter failed; restart drs_garages after correcting the target resource.'):format(provider))
+                    return
+                end
+
+                record.provider = provider
+                record.zoneId = zoneId
             end
         end,
         onExit = function()
-            DeleteEntity(ped)
+            cleanupPedPoint(record)
             SetModelAsNoLongerNeeded(model)
-            ped = nil
-
-            if id then
-                exports.qtarget:RemoveZone(id)
-                id = nil
-            end
         end
     })
+
+    managedPedPoints[record] = true
+    return record.point
 end
+
+AddEventHandler('onResourceStop', function(resource)
+    if resource ~= GetCurrentResourceName() then return end
+
+    for record in pairs(managedPedPoints) do
+        cleanupPedPoint(record)
+
+        if record.point then
+            record.point:remove()
+            record.point = nil
+        end
+    end
+
+    managedPedPoints = {}
+end)
 
 ---@param point1 vector3 | vector4 | number
 ---@param point2 vector3 | vector4 | number
@@ -136,7 +366,9 @@ function Utils.hasJobs(jobs)
     local playerJob = Framework.getJob()
     if not playerJob then return false end
 
-    for _, name in ipairs(jobs) do
+    for key, value in pairs(jobs) do
+        local name = type(key) == 'number' and value or key
+
         if playerJob == name then
             return true
         end

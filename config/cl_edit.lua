@@ -106,7 +106,8 @@ function SetVehicleOwner(plate, vehicle)
         -- Do not expose a client-callable netId-to-key handoff.
         return
     elseif Framework.name == 'qb-core' then
-        TriggerEvent('vehiclekeys:client:SetOwner', plate)
+        -- Current qb-vehiclekeys keys are granted by the validated server flow.
+        return
     elseif Framework.name == 'es_extended' then
         -- Not implemented by default.
     end

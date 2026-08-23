@@ -1,10 +1,13 @@
 local RESOURCE_NAME = GetCurrentResourceName()
 local TABLE_NAME = 'player_vehicles'
+local ESX_TABLE_NAME = 'owned_vehicles'
 local CONNECTION_ATTEMPTS = 20
 local CONNECTION_RETRY_DELAY = 250
+local SUPPORTED_CORE_RESOURCES = { 'qbx_core', 'qb-core', 'es_extended' }
 
-local BASE_COLUMNS = { 'citizenid', 'plate', 'garage', 'mods' }
+local BASE_COLUMNS = { 'citizenid', 'license', 'plate', 'garage', 'mods' }
 local MODEL_COLUMNS = { 'vehicle', 'hash' }
+local ESX_REQUIRED_COLUMNS = { 'owner', 'plate', 'vehicle', 'stored', 'job' }
 local COMPATIBILITY_COLUMNS = {
     {
         name = 'job',
@@ -34,12 +37,12 @@ local COMPATIBILITY_INDEXES = {
         name = 'idx_player_vehicles_job_type_stored',
         columns = { 'job', 'type', 'stored' },
         create = 'CREATE INDEX `idx_player_vehicles_job_type_stored` ON `player_vehicles` (`job`, `type`, `stored`)'
-    },
-    {
-        name = 'idx_player_vehicles_plate',
-        columns = { 'plate' },
-        create = 'CREATE INDEX `idx_player_vehicles_plate` ON `player_vehicles` (`plate`)'
     }
+}
+
+local UNIQUE_PLATE_INDEX_NAMES = {
+    [TABLE_NAME] = 'ux_player_vehicles_plate',
+    [ESX_TABLE_NAME] = 'ux_owned_vehicles_plate'
 }
 
 local migrationComplete = false
@@ -52,6 +55,7 @@ local readyPromise = promise.new()
 ---@field isUsable fun(): boolean, string?
 ---@field wasSuccessful fun(): boolean, string?
 ---@field awaitReady fun(): boolean, string?
+---@field getStatus fun(): table
 DRSGaragesDatabase = {}
 
 ---Returns whether the database setup attempt has finished.
@@ -83,6 +87,21 @@ function DRSGaragesDatabase.awaitReady()
     end
 
     return migrationSuccessful, migrationDetail
+end
+
+---Returns a serializable snapshot for diagnostics and companion resources.
+---@return table status
+function DRSGaragesDatabase.getStatus()
+    local databaseConfig = type(Config) == 'table' and Config.Database or nil
+
+    return {
+        ready = migrationComplete,
+        usable = migrationComplete and migrationSuccessful,
+        successful = migrationSuccessful,
+        detail = migrationDetail,
+        autoMigrate = not (type(databaseConfig) == 'table' and databaseConfig.AutoMigrate == false),
+        framework = type(Framework) == 'table' and Framework.name or nil
+    }
 end
 
 local function log(message)
@@ -126,6 +145,26 @@ local function update(sql, parameters)
     return true, affectedRows
 end
 
+---@param values string[]
+---@return string
+local function join(values)
+    return table.concat(values, ', ')
+end
+
+-- GetResourceState also resolves fxmanifest `provide` aliases. The resolved
+-- path identifies aliases of one running resource without hiding genuinely
+-- separate started framework resources.
+local function getStartedResourceIdentity(resource)
+    if GetResourceState(resource) ~= 'started' then return end
+
+    local path = GetResourcePath(resource)
+    if type(path) == 'string' and path ~= '' then
+        return ('path:%s'):format(path)
+    end
+
+    return ('name:%s'):format(resource)
+end
+
 ---@return string? schemaName
 ---@return string? errorMessage
 local function getCurrentSchema()
@@ -143,15 +182,18 @@ local function getCurrentSchema()
 end
 
 ---@param schemaName string
+---@param tableName? string
 ---@return boolean? exists
 ---@return string? errorMessage
-local function tableExists(schemaName)
+local function tableExists(schemaName, tableName)
+    tableName = tableName or TABLE_NAME
+
     local successful, rows = query([[
         SELECT 1 AS `present`
         FROM information_schema.TABLES
         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
         LIMIT 1
-    ]], { schemaName, TABLE_NAME })
+    ]], { schemaName, tableName })
 
     if not successful then
         return nil, ('could not inspect information_schema.TABLES: %s'):format(rows)
@@ -161,14 +203,24 @@ local function tableExists(schemaName)
 end
 
 ---@param schemaName string
----@return table<string, boolean>? columns
+---@param tableName? string
+---@return table<string, table>? columns
 ---@return string? errorMessage
-local function getColumns(schemaName)
+local function getColumns(schemaName, tableName)
+    tableName = tableName or TABLE_NAME
+
     local successful, rows = query([[
-        SELECT COLUMN_NAME AS `column_name`
+        SELECT
+            COLUMN_NAME AS `column_name`,
+            DATA_TYPE AS `data_type`,
+            COLUMN_TYPE AS `column_type`,
+            IS_NULLABLE AS `is_nullable`,
+            CHARACTER_MAXIMUM_LENGTH AS `character_maximum_length`,
+            NUMERIC_PRECISION AS `numeric_precision`,
+            COLUMN_DEFAULT AS `column_default`
         FROM information_schema.COLUMNS
         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-    ]], { schemaName, TABLE_NAME })
+    ]], { schemaName, tableName })
 
     if not successful then
         return nil, ('could not inspect information_schema.COLUMNS: %s'):format(rows)
@@ -177,27 +229,369 @@ local function getColumns(schemaName)
     local columns = {}
     for _, row in ipairs(rows or {}) do
         if type(row.column_name) == 'string' then
-            columns[row.column_name:lower()] = true
+            columns[row.column_name:lower()] = {
+                dataType = type(row.data_type) == 'string' and row.data_type:lower() or nil,
+                columnType = type(row.column_type) == 'string' and row.column_type:lower() or nil,
+                nullable = tostring(row.is_nullable or ''):upper() == 'YES',
+                characterMaximumLength = tonumber(row.character_maximum_length),
+                numericPrecision = tonumber(row.numeric_precision),
+                default = row.column_default
+            }
         end
     end
 
     return columns
 end
 
+local TEXT_DATA_TYPES = {
+    char = true,
+    varchar = true,
+    tinytext = true,
+    text = true,
+    mediumtext = true,
+    longtext = true,
+    json = true
+}
+local INTEGER_DATA_TYPES = {
+    tinyint = true,
+    smallint = true,
+    mediumint = true,
+    int = true,
+    integer = true,
+    bigint = true
+}
+local QB_COLUMN_REQUIREMENTS = {
+    citizenid = { kind = 'text', minimumLength = 50 },
+    license = { kind = 'text', minimumLength = 50 },
+    plate = { kind = 'text', minimumLength = 8 },
+    garage = { kind = 'text', minimumLength = 50 },
+    mods = { kind = 'text', minimumLength = 65535 },
+    job = { kind = 'text', minimumLength = 20, nullable = true, nullDefault = true },
+    type = { kind = 'text', minimumLength = 10, nullable = false },
+    stored = { kind = 'integer', nullable = false },
+    -- Stock qbx_vehicles leaves `state` nullable. Actual NULL rows are checked
+    -- and normalized below, so the official definition remains compatible.
+    state = { kind = 'integer' }
+}
+local QB_BASE_COLUMN_REQUIREMENTS = {
+    citizenid = QB_COLUMN_REQUIREMENTS.citizenid,
+    license = QB_COLUMN_REQUIREMENTS.license,
+    plate = QB_COLUMN_REQUIREMENTS.plate,
+    garage = QB_COLUMN_REQUIREMENTS.garage,
+    mods = QB_COLUMN_REQUIREMENTS.mods
+}
+local ESX_COLUMN_REQUIREMENTS = {
+    owner = { kind = 'text', minimumLength = 50 },
+    plate = { kind = 'text', minimumLength = 8 },
+    vehicle = { kind = 'text', minimumLength = 65535 },
+    stored = { kind = 'integer', nullable = false },
+    job = { kind = 'text', minimumLength = 20, nullable = true, nullDefault = true }
+}
+
+local function textColumnHasCapacity(column, minimumLength)
+    if not column or not TEXT_DATA_TYPES[column.dataType] then return false end
+    if column.dataType == 'json' then return true end
+
+    return tonumber(column.characterMaximumLength) ~= nil
+        and tonumber(column.characterMaximumLength) >= minimumLength
+end
+
+local function describeColumn(column)
+    if not column then return 'missing' end
+
+    return ('type=%s, nullable=%s, maxLength=%s, default=%s'):format(
+        tostring(column.columnType or column.dataType),
+        tostring(column.nullable),
+        tostring(column.characterMaximumLength),
+        tostring(column.default)
+    )
+end
+
+-- MariaDB exposes an explicit DEFAULT NULL as the unquoted string `NULL` in
+-- information_schema.COLUMNS, while a literal four-character string default
+-- is quoted as `'NULL'`. MySQL returns SQL NULL as Lua nil through oxmysql.
+local function isNullColumnDefault(value)
+    if value == nil then return true end
+    if type(value) ~= 'string' then return false end
+
+    return value:match('^%s*(.-)%s*$'):upper() == 'NULL'
+end
+
+local function validateColumnDefinitions(columns, requirements)
+    local invalid = {}
+
+    for name, requirement in pairs(requirements) do
+        local column = columns[name]
+        local valid = column ~= nil
+
+        if valid and requirement.kind == 'text' then
+            valid = textColumnHasCapacity(column, requirement.minimumLength or 1)
+        elseif valid and requirement.kind == 'integer' then
+            valid = INTEGER_DATA_TYPES[column.dataType] == true
+        end
+
+        if valid and requirement.nullable ~= nil then
+            valid = column.nullable == requirement.nullable
+        end
+
+        if valid and requirement.nullDefault then
+            valid = isNullColumnDefault(column.default)
+        end
+
+        if not valid then
+            invalid[#invalid + 1] = ('`%s` (%s)'):format(name, describeColumn(column))
+        end
+    end
+
+    table.sort(invalid)
+    return #invalid == 0, invalid
+end
+
+local function validatePresentColumnDefinitions(columns, requirements)
+    local presentRequirements = {}
+
+    for name, requirement in pairs(requirements) do
+        if columns[name] then presentRequirements[name] = requirement end
+    end
+
+    return validateColumnDefinitions(columns, presentRequirements)
+end
+
+local function hasUsableModelColumn(columns)
+    local vehicle = columns.vehicle
+    if vehicle and textColumnHasCapacity(vehicle, 1) then return true end
+
+    local hash = columns.hash
+    return hash ~= nil and (
+        INTEGER_DATA_TYPES[hash.dataType] == true
+        or textColumnHasCapacity(hash, 1)
+    )
+end
+
+local function invalidColumnDefinitionsMessage(tableName, invalid)
+    return ('`%s` has incompatible column definition(s): %s. Restore compatible framework definitions manually; automatic and supplied migrations do not rewrite existing columns. Then restart DRS Garages.'):format(
+        tableName,
+        join(invalid)
+    )
+end
+
+local function validatePlateValues(tableName)
+    local predicate = [[
+        `plate` IS NULL
+        OR TRIM(`plate`) = ''
+        OR CHAR_LENGTH(TRIM(`plate`)) > 8
+        OR UPPER(TRIM(`plate`)) NOT REGEXP '^[A-Z0-9 ]+$'
+    ]]
+    local counted, countRows = query(([[
+        SELECT COUNT(*) AS `invalid_count`
+        FROM `%s`
+        WHERE %s
+    ]]):format(tableName, predicate))
+    local invalidCount = counted and countRows and countRows[1]
+        and tonumber(countRows[1].invalid_count)
+        or nil
+
+    if not counted or not invalidCount or invalidCount < 0 or invalidCount % 1 ~= 0 then
+        return false, ('could not validate plate values in `%s`: %s'):format(
+            tableName,
+            counted and tostring(invalidCount) or tostring(countRows)
+        )
+    end
+
+    if invalidCount == 0 then return true end
+
+    local selected, examples = query(([[
+        SELECT `plate`
+        FROM `%s`
+        WHERE %s
+        LIMIT 10
+    ]]):format(tableName, predicate))
+    local labels = {}
+    if selected then
+        for _, row in ipairs(examples or {}) do
+            labels[#labels + 1] = row.plate == nil and '<NULL>' or ('%q'):format(tostring(row.plate))
+        end
+    end
+
+    return false, ('`%s` contains %d invalid plate value(s)%s. Plates must trim to 1-8 characters using only A-Z, 0-9, and spaces; repair them manually after a backup.'):format(
+        tableName,
+        invalidCount,
+        #labels > 0 and (': ' .. join(labels)) or ''
+    )
+end
+
+---@param autoMigrate boolean
+---@return boolean successful
+---@return string? errorMessage
+local function ensureUsableQbRuntimeValues(autoMigrate)
+    local checked, invalidRows = query([[
+        SELECT COUNT(*) AS `invalid_count`
+        FROM `player_vehicles`
+        WHERE (`stored` IS NOT NULL AND `stored` NOT IN (0, 1))
+           OR (`state` IS NOT NULL AND `state` NOT IN (0, 1, 2))
+    ]])
+    local invalidCount = checked and invalidRows and invalidRows[1]
+        and tonumber(invalidRows[1].invalid_count)
+        or nil
+
+    if not checked then
+        return false, ('could not validate storage-state values: %s'):format(tostring(invalidRows))
+    end
+
+    if not invalidCount or invalidCount < 0 or invalidCount % 1 ~= 0 then
+        return false, 'could not validate storage-state values because the database returned an invalid count'
+    end
+
+    if invalidCount > 0 then
+        return false, ('`player_vehicles` contains %d row(s) with unsupported `stored`/`state` values. Use stored 0/1 and state 0/1/2 before starting DRS Garages.'):format(invalidCount)
+    end
+
+    local counted, repairableRows = query([[
+        SELECT COUNT(*) AS `repairable_count`
+        FROM `player_vehicles`
+        WHERE `type` IS NULL OR TRIM(`type`) = '' OR `stored` IS NULL OR `state` IS NULL
+    ]])
+    local repairableCount = counted and repairableRows and repairableRows[1]
+        and tonumber(repairableRows[1].repairable_count)
+        or nil
+
+    if not counted then
+        return false, ('could not inspect null runtime values: %s'):format(tostring(repairableRows))
+    end
+
+    if not repairableCount or repairableCount < 0 or repairableCount % 1 ~= 0 then
+        return false, 'could not inspect null runtime values because the database returned an invalid count'
+    end
+
+    if repairableCount > 0 then
+        if not autoMigrate then
+            return false, ('automatic migration is disabled and `player_vehicles` contains %d row(s) with an empty type or NULL storage state'):format(
+                repairableCount
+            )
+        end
+
+        local normalizedType, typeError = update([[
+            UPDATE `player_vehicles`
+            SET `type` = 'car'
+            WHERE `type` IS NULL OR TRIM(`type`) = ''
+        ]])
+        if not normalizedType then
+            return false, ('could not normalize empty vehicle types: %s'):format(tostring(typeError))
+        end
+
+        -- Resolve `state` first. If both values are NULL, fail safe to an out
+        -- state instead of silently returning an unknown vehicle to storage.
+        local normalizedState, stateError = update([[
+            UPDATE `player_vehicles`
+            SET `state` = CASE WHEN `stored` = 1 THEN 1 ELSE 0 END
+            WHERE `state` IS NULL
+        ]])
+        if not normalizedState then
+            return false, ('could not normalize NULL vehicle states: %s'):format(tostring(stateError))
+        end
+
+        local normalizedStored, storedError = update([[
+            UPDATE `player_vehicles`
+            SET `stored` = CASE WHEN `state` = 1 THEN 1 ELSE 0 END
+            WHERE `stored` IS NULL
+        ]])
+        if not normalizedStored then
+            return false, ('could not normalize NULL stored values: %s'):format(tostring(storedError))
+        end
+
+        local verified, remainingRows = query([[
+            SELECT COUNT(*) AS `remaining_count`
+            FROM `player_vehicles`
+            WHERE `type` IS NULL OR TRIM(`type`) = '' OR `stored` IS NULL OR `state` IS NULL
+        ]])
+        local remainingCount = verified and remainingRows and remainingRows[1]
+            and tonumber(remainingRows[1].remaining_count)
+            or nil
+
+        if not verified or remainingCount ~= 0 then
+            return false, ('could not verify normalized runtime values (remaining=%s, error=%s)'):format(
+                tostring(remainingCount),
+                verified and 'none' or tostring(remainingRows)
+            )
+        end
+
+        log(('Normalized %d player_vehicles row(s) with empty type or NULL storage state.'):format(repairableCount))
+    end
+
+    local pairsChecked, inconsistentRows = query([[
+        SELECT COUNT(*) AS `inconsistent_count`
+        FROM `player_vehicles`
+        WHERE NOT ((`stored` = 1 AND `state` = 1)
+                OR (`stored` = 0 AND `state` IN (0, 2)))
+    ]])
+    local inconsistentCount = pairsChecked and inconsistentRows and inconsistentRows[1]
+        and tonumber(inconsistentRows[1].inconsistent_count)
+        or nil
+
+    if not pairsChecked or not inconsistentCount or inconsistentCount < 0 or inconsistentCount % 1 ~= 0 then
+        return false, ('could not validate paired storage state: %s'):format(
+            pairsChecked and tostring(inconsistentCount) or tostring(inconsistentRows)
+        )
+    end
+
+    if inconsistentCount > 0 then
+        if not autoMigrate then
+            return false, ('automatic migration is disabled and `player_vehicles` contains %d inconsistent stored/state pair(s); valid pairs are (1,1), (0,0), and (0,2)'):format(
+                inconsistentCount
+            )
+        end
+
+        local synchronized, synchronizeError = update([[
+            UPDATE `player_vehicles`
+            SET `stored` = CASE WHEN `state` = 1 THEN 1 ELSE 0 END
+            WHERE NOT ((`stored` = 1 AND `state` = 1)
+                    OR (`stored` = 0 AND `state` IN (0, 2)))
+        ]])
+        if not synchronized then
+            return false, ('could not synchronize inconsistent stored/state pairs: %s'):format(tostring(synchronizeError))
+        end
+
+        local verified, remainingRows = query([[
+            SELECT COUNT(*) AS `remaining_count`
+            FROM `player_vehicles`
+            WHERE NOT ((`stored` = 1 AND `state` = 1)
+                    OR (`stored` = 0 AND `state` IN (0, 2)))
+        ]])
+        local remainingCount = verified and remainingRows and remainingRows[1]
+            and tonumber(remainingRows[1].remaining_count)
+            or nil
+
+        if not verified or remainingCount ~= 0 then
+            return false, ('could not verify synchronized stored/state pairs (remaining=%s, error=%s)'):format(
+                tostring(remainingCount),
+                verified and 'none' or tostring(remainingRows)
+            )
+        end
+
+        log(('Synchronized %d inconsistent player_vehicles stored/state pair(s) using state as authoritative.'):format(inconsistentCount))
+    end
+
+    return true
+end
+
 ---@param schemaName string
+---@param tableName? string
 ---@return table<string, table>? indexes
 ---@return string? errorMessage
-local function getIndexes(schemaName)
+local function getIndexes(schemaName, tableName)
+    tableName = tableName or TABLE_NAME
+
     local successful, rows = query([[
         SELECT
             INDEX_NAME AS `index_name`,
             NON_UNIQUE AS `non_unique`,
             SEQ_IN_INDEX AS `sequence`,
-            COLUMN_NAME AS `column_name`
+            COLUMN_NAME AS `column_name`,
+            SUB_PART AS `sub_part`
         FROM information_schema.STATISTICS
         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
         ORDER BY INDEX_NAME, SEQ_IN_INDEX
-    ]], { schemaName, TABLE_NAME })
+    ]], { schemaName, tableName })
 
     if not successful then
         return nil, ('could not inspect information_schema.STATISTICS: %s'):format(rows)
@@ -212,7 +606,8 @@ local function getIndexes(schemaName)
             if not index then
                 index = {
                     nonUnique = row.non_unique == true or tonumber(row.non_unique) == 1,
-                    columns = {}
+                    columns = {},
+                    subParts = {}
                 }
                 indexes[indexName] = index
             end
@@ -220,6 +615,7 @@ local function getIndexes(schemaName)
             local sequence = tonumber(row.sequence)
             if sequence and type(row.column_name) == 'string' then
                 index.columns[sequence] = row.column_name:lower()
+                index.subParts[sequence] = tonumber(row.sub_part)
             end
         end
     end
@@ -236,18 +632,12 @@ local function indexMatches(actual, expected)
     end
 
     for index, columnName in ipairs(expected) do
-        if actual.columns[index] ~= columnName then
+        if actual.columns[index] ~= columnName or actual.subParts[index] ~= nil then
             return false
         end
     end
 
     return true
-end
-
----@param values string[]
----@return string
-local function join(values)
-    return table.concat(values, ', ')
 end
 
 local SHARED_TYPE_TO_GARAGE_TYPE = {
@@ -266,6 +656,16 @@ local SHARED_CATEGORY_TO_GARAGE_TYPE = {
     motorcycles = 'car',
     planes = 'air',
     submarines = 'boat'
+}
+
+-- Some official QB/Qbox metadata classifies these by service category rather
+-- than their native vehicle class. These values are authoritative for the
+-- one-time garage-type backfill.
+local GARAGE_TYPE_EXCEPTIONS = {
+    polmav = 'air',
+    thruster = 'air',
+    predator = 'boat',
+    seashark2 = 'boat'
 }
 
 local UINT32_RANGE = 4294967296
@@ -324,17 +724,17 @@ end
 ---@param hashLookup table<string, string|boolean>
 ---@param value any
 ---@param garageType string
-local function addModelLookup(nameLookup, hashLookup, value, garageType)
+local function addModelLookup(nameLookup, hashLookup, value, garageType, authoritative)
     local hash = normalizedHash(value)
     if hash then
-        addLookupValue(hashLookup, hash, garageType)
+        if authoritative then hashLookup[hash] = garageType else addLookupValue(hashLookup, hash, garageType) end
         return
     end
 
     local name = normalizedText(value)
     if not name then return end
 
-    addLookupValue(nameLookup, name, garageType)
+    if authoritative then nameLookup[name] = garageType else addLookupValue(nameLookup, name, garageType) end
 
     local hashFunction = type(joaat) == 'function' and joaat
         or type(GetHashKey) == 'function' and GetHashKey
@@ -342,7 +742,12 @@ local function addModelLookup(nameLookup, hashLookup, value, garageType)
     if hashFunction then
         local successful, modelHash = pcall(hashFunction, name)
         if successful then
-            addLookupValue(hashLookup, normalizedHash(modelHash), garageType)
+            local normalizedModelHash = normalizedHash(modelHash)
+            if authoritative then
+                if normalizedModelHash then hashLookup[normalizedModelHash] = garageType end
+            else
+                addLookupValue(hashLookup, normalizedModelHash, garageType)
+            end
         end
     end
 end
@@ -409,6 +814,10 @@ local function buildVehicleTypeLookups(frameworkName)
                 end
             end
         end
+    end
+
+    for modelName, garageType in pairs(GARAGE_TYPE_EXCEPTIONS) do
+        addModelLookup(nameLookup, hashLookup, modelName, garageType, true)
     end
 
     return nameLookup, hashLookup, warning
@@ -528,23 +937,260 @@ local function backfillVehicleTypes(columns, frameworkName)
     return true
 end
 
+---@param columns table<string, boolean>
+---@param required string[]
+---@return string[] missing
+local function findMissingColumns(columns, required)
+    local missing = {}
+
+    for _, columnName in ipairs(required) do
+        if not columns[columnName] then
+            missing[#missing + 1] = columnName
+        end
+    end
+
+    return missing
+end
+
+---@param schemaName string
+---@return boolean valid
+---@return string detail
+local function validateCompatibilityIndexes(schemaName)
+    local indexes, indexError = getIndexes(schemaName)
+    if not indexes then return false, indexError end
+
+    local missing = {}
+    local invalid = {}
+
+    for _, expected in ipairs(COMPATIBILITY_INDEXES) do
+        local existing = indexes[expected.name]
+
+        if not existing then
+            missing[#missing + 1] = expected.name
+        elseif not indexMatches(existing, expected.columns) then
+            invalid[#invalid + 1] = expected.name
+        end
+    end
+
+    if #missing > 0 then
+        return false, ('missing required compatibility index(es): %s'):format(join(missing))
+    end
+
+    if #invalid > 0 then
+        return false, ('named index(es) have unexpected definitions: %s'):format(join(invalid))
+    end
+
+    return true, 'compatibility indexes are ready'
+end
+
+---@param indexes table<string, table>
+---@return string? indexName
+local function findUniquePlateIndex(indexes)
+    for indexName, index in pairs(indexes) do
+        if index.nonUnique == false
+            and #index.columns == 1
+            and index.columns[1] == 'plate'
+            and index.subParts[1] == nil
+        then
+            return indexName
+        end
+    end
+end
+
+---@param tableName string
+---@return table[]? duplicates
+---@return string? errorMessage
+local function getDuplicateNormalizedPlates(tableName)
+    local successful, rows = query(([=[
+        SELECT
+            UPPER(TRIM(`plate`)) AS `normalized_plate`,
+            COUNT(*) AS `duplicate_count`
+        FROM `%s`
+        WHERE `plate` IS NOT NULL
+        GROUP BY UPPER(TRIM(`plate`))
+        HAVING COUNT(*) > 1
+        ORDER BY `duplicate_count` DESC, `normalized_plate` ASC
+        LIMIT 10
+    ]=]):format(tableName))
+
+    if not successful then
+        return nil, ('could not check normalized plate uniqueness in `%s`: %s'):format(tableName, rows)
+    end
+
+    return rows or {}
+end
+
+
+---@param schemaName string
+---@param tableName string
+---@param allowCreate boolean
+---@return boolean valid
+---@return string detail
+local function ensureUniquePlateIndex(schemaName, tableName, allowCreate)
+    local indexes, indexError = getIndexes(schemaName, tableName)
+    if not indexes then return false, indexError end
+
+    local duplicates, duplicateError = getDuplicateNormalizedPlates(tableName)
+    if not duplicates then return false, duplicateError end
+
+    if #duplicates > 0 then
+        local examples = {}
+
+        for _, duplicate in ipairs(duplicates) do
+            local plate = duplicate.normalized_plate
+            if plate == nil or plate == '' then plate = '<blank>' end
+
+            examples[#examples + 1] = ('%s (%s rows)'):format(
+                tostring(plate),
+                tostring(duplicate.duplicate_count or '?')
+            )
+        end
+
+        return false, ('`%s` contains duplicate normalized plates: %s. Back up the database and resolve each duplicate manually; DRS Garages will never delete or merge owned vehicles automatically.'):format(
+            tableName,
+            join(examples)
+        )
+    end
+
+    -- DRS keys active vehicles by an upper-cased, trimmed plate. Check that
+    -- normalized invariant even when the database already has a UNIQUE index;
+    -- a case-sensitive/binary collation can otherwise permit colliding keys.
+    local existingName = findUniquePlateIndex(indexes)
+    if existingName then
+        return true, ('unique full-column plate index `%s` is ready'):format(existingName)
+    end
+
+    local expectedName = UNIQUE_PLATE_INDEX_NAMES[tableName] or ('ux_%s_plate'):format(tableName)
+    if not allowCreate then
+        return false, ('`%s` has no unique full-column plate index. No duplicates were found, but automatic migration is disabled; create a UNIQUE index on the complete `plate` column manually.'):format(
+            tableName
+        )
+    end
+
+    if indexes[expectedName] then
+        return false, ('index `%s` already exists but is not a unique full-column plate index. Correct it manually; automatic migration will not drop or replace indexes.'):format(
+            expectedName
+        )
+    end
+
+    local createSql = ('CREATE UNIQUE INDEX `%s` ON `%s` (`plate`)'):format(expectedName, tableName)
+    local created, createError = query(createSql)
+    local refreshedIndexes, refreshError = getIndexes(schemaName, tableName)
+    local refreshedName = refreshedIndexes and findUniquePlateIndex(refreshedIndexes) or nil
+
+    if refreshedName then
+        if created then
+            log(('Added unique plate index `%s` to `%s`.'):format(refreshedName, tableName))
+        else
+            log(('A unique plate index `%s` was added concurrently; continuing.'):format(refreshedName))
+        end
+
+        return true, ('unique full-column plate index `%s` is ready'):format(refreshedName)
+    end
+
+    if not refreshedIndexes then
+        return false, ('could not verify the unique plate index after creation: %s'):format(tostring(refreshError))
+    end
+
+    return false, ('could not add unique plate index `%s`: %s. Grant the database user INDEX permission or create a UNIQUE full-column plate index manually.'):format(
+        expectedName,
+        tostring(createError)
+    )
+end
+
+---@param schemaName string
+---@param autoMigrate boolean
+---@return boolean valid
+---@return string detail
+local function validateEsxSchema(schemaName, autoMigrate)
+    local exists, tableError = tableExists(schemaName, ESX_TABLE_NAME)
+    if exists == nil then return false, tableError end
+
+    if not exists then
+        return false, ("`%s`.`%s` is missing. Import the ESX owned-vehicle schema before starting DRS Garages."):format(
+            schemaName,
+            ESX_TABLE_NAME
+        )
+    end
+
+    local columns, columnError = getColumns(schemaName, ESX_TABLE_NAME)
+    if not columns then return false, columnError end
+
+    local missing = findMissingColumns(columns, ESX_REQUIRED_COLUMNS)
+    if #missing > 0 then
+        return false, ("`%s` is missing required runtime column(s): %s. DRS Garages does not add missing ESX columns automatically."):format(
+            ESX_TABLE_NAME,
+            join(missing)
+        )
+    end
+
+    local definitionsValid, invalidDefinitions = validateColumnDefinitions(columns, ESX_COLUMN_REQUIREMENTS)
+    if not definitionsValid then
+        return false, invalidColumnDefinitionsMessage(ESX_TABLE_NAME, invalidDefinitions)
+    end
+
+    local platesValid, plateError = validatePlateValues(ESX_TABLE_NAME)
+    if not platesValid then return false, plateError end
+
+    local uniquePlateReady, uniquePlateDetail = ensureUniquePlateIndex(schemaName, ESX_TABLE_NAME, autoMigrate)
+    if not uniquePlateReady then return false, uniquePlateDetail end
+
+    return true, ('ESX owned_vehicles schema is ready; %s'):format(uniquePlateDetail)
+end
+
 ---@return boolean successful
 ---@return string detail
 local function migrate()
     local databaseConfig = type(Config) == 'table' and Config.Database or nil
-    if type(databaseConfig) == 'table' and databaseConfig.AutoMigrate == false then
-        log('Automatic migration is disabled by Config.Database.AutoMigrate.')
-        return true, 'automatic migration disabled'
+    local autoMigrate = not (type(databaseConfig) == 'table' and databaseConfig.AutoMigrate == false)
+
+    if not autoMigrate then
+        log('Automatic migration is disabled; validating the existing schema without changing it.')
     end
 
     local frameworkName = type(Framework) == 'table' and Framework.name or nil
-    if frameworkName == 'es_extended' then
-        log('ESX detected; QB/Qbox player_vehicles migration is not required.')
-        return true, 'ESX does not require the player_vehicles migration'
+
+    local startedCoreResources = {}
+    local startedCoreIdentities = {}
+    for _, resource in ipairs(SUPPORTED_CORE_RESOURCES) do
+        local identity = getStartedResourceIdentity(resource)
+
+        if identity and not startedCoreIdentities[identity] then
+            startedCoreIdentities[identity] = true
+            startedCoreResources[#startedCoreResources + 1] = resource
+        end
     end
 
-    if frameworkName ~= 'qb-core' and frameworkName ~= 'qbx_core' then
+    if #startedCoreResources == 0 then
+        return false, 'no supported framework core is started (qbx_core, qb-core, or es_extended); database setup refuses to choose an adapter implicitly.'
+    end
+
+    if #startedCoreResources > 1 then
+        return false, ('multiple supported framework cores are started (%s). Stop the extra core resource(s); database setup refuses to choose an adapter implicitly.'):format(
+            join(startedCoreResources)
+        )
+    end
+
+    local startedFrameworkName = startedCoreResources[1]
+    if frameworkName ~= startedFrameworkName then
+        return false, ('the loaded framework adapter (%s) does not match the single started core (%s); database setup is blocked until resource startup is consistent.'):format(
+            tostring(frameworkName),
+            startedFrameworkName
+        )
+    end
+
+    if frameworkName ~= 'es_extended' and frameworkName ~= 'qb-core' and frameworkName ~= 'qbx_core' then
         return false, ('cannot migrate before a supported framework is detected (got %s)'):format(tostring(frameworkName))
+    end
+
+    if frameworkName == 'qbx_core' then
+        local persistenceEnabled = tostring(GetConvar('qbx:enableVehiclePersistence', 'false')):lower()
+        local persistenceType = tostring(GetConvar('qbx:vehiclePersistenceType', 'semi')):lower()
+        local enabled = persistenceEnabled == 'true' or persistenceEnabled == '1' or persistenceEnabled == 'yes'
+
+        if enabled and persistenceType == 'full' then
+            return false, 'Qbox full vehicle persistence conflicts with DRS restart/storage ownership. Set qbx:enableVehiclePersistence false or use qbx:vehiclePersistenceType semi, then restart qbx_core, qbx_vehicles, and drs_garages.'
+        end
     end
 
     local schemaName, schemaError
@@ -559,6 +1205,11 @@ local function migrate()
 
     if not schemaName then
         return false, ('database connection was not ready after %d attempts: %s'):format(CONNECTION_ATTEMPTS, schemaError)
+    end
+
+    if frameworkName == 'es_extended' then
+        log('ESX detected; validating owned_vehicles without applying QB/Qbox migrations.')
+        return validateEsxSchema(schemaName, autoMigrate)
     end
 
     local exists, tableError = tableExists(schemaName)
@@ -586,16 +1237,65 @@ local function migrate()
         return false, ("`%s` is missing required framework column(s): %s. Restore the standard QB/Qbox table schema manually; automatic migration only adds job, type, stored, and state."):format(TABLE_NAME, join(missingBaseColumns))
     end
 
-    local hasModelColumn = false
-    for _, columnName in ipairs(MODEL_COLUMNS) do
-        if columns[columnName] then
-            hasModelColumn = true
-            break
-        end
+    local baseDefinitionsValid, invalidBaseDefinitions = validateColumnDefinitions(columns, QB_BASE_COLUMN_REQUIREMENTS)
+    if not baseDefinitionsValid then
+        return false, invalidColumnDefinitionsMessage(TABLE_NAME, invalidBaseDefinitions)
     end
 
-    if not hasModelColumn then
+    if not hasUsableModelColumn(columns) then
         return false, ("`%s` needs at least one usable vehicle model column (`vehicle` or `hash`). Restore the framework's standard schema manually; automatic migration will not invent model data."):format(TABLE_NAME)
+    end
+
+    local presentDefinitionsValid, invalidPresentDefinitions = validatePresentColumnDefinitions(columns, QB_COLUMN_REQUIREMENTS)
+    if not presentDefinitionsValid then
+        return false, invalidColumnDefinitionsMessage(TABLE_NAME, invalidPresentDefinitions)
+    end
+
+    local platesValid, plateError = validatePlateValues(TABLE_NAME)
+    if not platesValid then return false, plateError end
+
+    if not columns.stored and not columns.state then
+        return false, ("`%s` is missing both `stored` and `state`. No authoritative vehicle-location state exists, so DRS Garages will not guess or mark every existing vehicle stored. Add one authoritative column and reconcile its values manually before restarting."):format(
+            TABLE_NAME
+        )
+    end
+
+    if not autoMigrate then
+        local compatibilityColumnNames = {}
+
+        for _, column in ipairs(COMPATIBILITY_COLUMNS) do
+            compatibilityColumnNames[#compatibilityColumnNames + 1] = column.name
+        end
+
+        local missingCompatibilityColumns = findMissingColumns(columns, compatibilityColumnNames)
+        if #missingCompatibilityColumns > 0 then
+            return false, ('automatic migration is disabled and `%s` is missing compatibility column(s): %s'):format(
+                TABLE_NAME,
+                join(missingCompatibilityColumns)
+            )
+        end
+
+        local definitionsValid, invalidDefinitions = validateColumnDefinitions(columns, QB_COLUMN_REQUIREMENTS)
+        if not definitionsValid then
+            return false, invalidColumnDefinitionsMessage(TABLE_NAME, invalidDefinitions)
+        end
+
+        local valuesUsable, valuesError = ensureUsableQbRuntimeValues(false)
+        if not valuesUsable then return false, valuesError end
+
+        local indexesValid, indexDetail = validateCompatibilityIndexes(schemaName)
+        if not indexesValid then
+            return false, ('automatic migration is disabled and the existing schema is incomplete: %s'):format(indexDetail)
+        end
+
+        local uniquePlateReady, uniquePlateDetail = ensureUniquePlateIndex(schemaName, TABLE_NAME, false)
+        if not uniquePlateReady then
+            return false, ('automatic migration is disabled and the plate invariant is not ready: %s'):format(uniquePlateDetail)
+        end
+
+        return true, ('database schema is ready (automatic migration disabled; read-only validation passed; %s)'):format(
+            uniquePlateDetail
+        )
     end
 
     local newlyAdded = {}
@@ -644,6 +1344,23 @@ local function migrate()
     if #failedColumns > 0 then
         return false, ('could not add compatibility column(s): %s. Grant the database user ALTER permission or import sql/qbox_drs_garages.sql manually, then restart the resource.'):format(join(failedColumns))
     end
+
+    local refreshedColumns, refreshColumnError = getColumns(schemaName)
+    if not refreshedColumns then
+        return false, ('could not verify compatibility columns after migration: %s'):format(tostring(refreshColumnError))
+    end
+    columns = refreshedColumns
+
+    local definitionsValid, invalidDefinitions = validateColumnDefinitions(columns, QB_COLUMN_REQUIREMENTS)
+    if not definitionsValid then
+        return false, invalidColumnDefinitionsMessage(TABLE_NAME, invalidDefinitions)
+    end
+
+    local valuesUsable, valuesError = ensureUsableQbRuntimeValues(true)
+    if not valuesUsable then return false, valuesError end
+
+    local uniquePlateReady, uniquePlateDetail = ensureUniquePlateIndex(schemaName, TABLE_NAME, true)
+    if not uniquePlateReady then return false, uniquePlateDetail end
 
     local inferred, inferenceError = backfillVehicleTypes(columns, frameworkName)
     if not inferred then

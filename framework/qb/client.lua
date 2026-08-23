@@ -1,4 +1,6 @@
-if GetResourceState('qb-core') ~= 'started' then return end
+-- qbx_core advertises a qb-core compatibility alias. Leave Qbox exclusively to
+-- the native Qbox adapter instead of initializing both adapters in sequence.
+if GetResourceState('qbx_core') == 'started' or GetResourceState('qb-core') ~= 'started' then return end
 
 Framework = { name = 'qb-core' }
 local sharedObject = exports['qb-core']:GetCoreObject()

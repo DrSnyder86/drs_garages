@@ -3,9 +3,15 @@ fx_version 'cerulean'
 game 'gta5'
 lua54 'yes'
 
-author 'DRS; based on Lunar Scripts lunar_garage'
+author 'DRS'
 description 'DRS Garages - multi-framework vehicle garage system'
-version '2.1.0-drs.1'
+version '2.2.0-drs.3'
+
+dependencies {
+    'ox_lib',
+    'oxmysql',
+    '/onesync'
+}
 
 files {
     'locales/*.json'
@@ -31,6 +37,5 @@ server_scripts {
     'utils/sv_main.lua',
     'config/sv_config.lua',
     'utils/sv_database.lua',
-    'locales/*.lua',
     'server/*.lua'
 }

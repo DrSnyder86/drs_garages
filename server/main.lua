@@ -2,14 +2,26 @@
 ---@type table<string, number>
 local activeVehicles = {}
 local vehicleStorageOperations = {}
+local vehicleRetrievalOperations = {}
+local vehicleExternalOperations = {}
+local vehicleReconciliationQuarantine = {}
 local propertyGarages = {}
 
 local UINT32 = 4294967296
 local ACTIVE_VEHICLE_REGISTRATION_DISTANCE = 75.0
 local VEHICLE_DELETE_RETRY_COUNT = 20
 local VEHICLE_DELETE_RETRY_INTERVAL = 100
+local VEHICLE_OWNER_TIMEOUT = 5000
 local MAX_GARAGE_STORAGE_NAME_LENGTH = 50
+local SERVER_DISTANCE_TOLERANCE = 2.0
 local databaseNotificationTimes = {}
+local storageWarnings = {}
+local publicStorageCatalogValid = true
+local getActiveVehicleByPlate
+local startupReconciliationComplete = false
+local startupReconciliationSuccessful = false
+local startupReconciliationDetail = 'startup vehicle reconciliation is still running'
+local missingDatabaseApiWarned = false
 
 local function stableHash(value)
     local hash = 2166136261
@@ -21,11 +33,22 @@ local function stableHash(value)
     return ('%08x'):format(hash)
 end
 
+local function isStorageSafeGarageName(value)
+    if type(value) ~= 'string' then return false end
+
+    value = value:match('^%s*(.-)%s*$')
+
+    return value ~= ''
+        and #value <= MAX_GARAGE_STORAGE_NAME_LENGTH
+        and value:match('^[%w_%-]+$') ~= nil
+end
+
 local function storageSafeGarageName(value)
     if value == nil then return end
 
     value = tostring(value):match('^%s*(.-)%s*$')
     if value == '' then return end
+    value = value:gsub('[^%w_%-]', '_')
     if #value <= MAX_GARAGE_STORAGE_NAME_LENGTH then return value end
 
     local prefixLength = MAX_GARAGE_STORAGE_NAME_LENGTH - 17
@@ -33,6 +56,55 @@ local function storageSafeGarageName(value)
     local suffix = stableHash(value) .. stableHash(value:reverse())
 
     return ('%s_%s'):format(prefix, suffix)
+end
+
+local function storageWarningOnce(key, message)
+    if storageWarnings[key] then return end
+
+    storageWarnings[key] = true
+    print(('[drs_garages] WARNING: %s'):format(message))
+end
+
+local function normalizeStorageName(value)
+    if value == nil then return end
+
+    value = tostring(value):match('^%s*(.-)%s*$')
+    if not value or value == '' then return end
+
+    return value:lower()
+end
+
+local function getStorageConfig()
+    return type(Config.Storage) == 'table' and Config.Storage or {}
+end
+
+local function getRequestedStorageMode()
+    return tostring(getStorageConfig().Mode or 'global'):lower()
+end
+
+local function getStorageMode()
+    local mode = getRequestedStorageMode()
+
+    if mode ~= 'global' and mode ~= 'garage' and mode ~= 'property' then
+        storageWarningOnce(('invalid-mode:%s'):format(mode), ('Config.Storage.Mode `%s` is invalid; using `global`.'):format(mode))
+        mode = 'global'
+    end
+
+    if mode ~= 'global' and Framework.name == 'es_extended' then
+        storageWarningOnce('esx-storage-mode', ('Config.Storage.Mode `%s` needs a verified ESX garage column; using `global` to protect the existing owned_vehicles schema.'):format(mode))
+        mode = 'global'
+    end
+
+    if mode ~= 'global' and not publicStorageCatalogValid then
+        storageWarningOnce('invalid-storage-catalog-mode', ('Config.Storage.Mode `%s` cannot run with duplicate or invalid public garage ids; using `global` until the catalog is corrected.'):format(mode))
+        mode = 'global'
+    end
+
+    return mode
+end
+
+local function recoveryEnabled(name)
+    return getStorageConfig()[name] ~= false
 end
 
 local function notifyDatabaseUnavailable(source)
@@ -43,29 +115,57 @@ local function notifyDatabaseUnavailable(source)
     if databaseNotificationTimes[source] and now - databaseNotificationTimes[source] < 5000 then return end
 
     databaseNotificationTimes[source] = now
-    TriggerClientEvent('drs_garages:showNotification', source, 'Garages are temporarily unavailable because the vehicle database is not ready. Check the server console.', 'error')
+    TriggerClientEvent('drs_garages:showNotification', source, locale('database_unavailable'), 'error')
+end
+
+local function refundImpoundCharge(player, amount, source, plate)
+    amount = tonumber(amount)
+    if not amount or amount <= 0 then return true end
+
+    if not player or type(player.addAccountMoney) ~= 'function' then
+        print(('[drs_garages] CRITICAL impound refund failure (source=%s, plate=%s, amount=%s): player adapter is unavailable'):format(
+            tostring(source),
+            tostring(plate),
+            tostring(amount)
+        ))
+        return false
+    end
+
+    local refundOk, refundResult = pcall(player.addAccountMoney, player, 'money', amount)
+    if refundOk and refundResult == true then return true end
+
+    print(('[drs_garages] CRITICAL impound refund failure (source=%s, plate=%s, amount=%s): %s'):format(
+        tostring(source),
+        tostring(plate),
+        tostring(amount),
+        tostring(refundOk and refundResult or refundResult)
+    ))
+    TriggerClientEvent('drs_garages:showNotification', source, locale('impound_refund_failed'), 'error')
+
+    return false
 end
 
 local function databaseIsUsable(source)
     local databaseApi = rawget(_G, 'DRSGaragesDatabase')
-    if type(databaseApi) ~= 'table' then return true end
-
-    if type(databaseApi.isReady) == 'function' then
-        local readyOk, ready = pcall(databaseApi.isReady)
-
-        if not readyOk or not ready then
-            notifyDatabaseUnavailable(source)
-            return false, readyOk and 'database setup is still running' or tostring(ready)
+    if type(databaseApi) ~= 'table' or type(databaseApi.isUsable) ~= 'function' then
+        if not missingDatabaseApiWarned then
+            missingDatabaseApiWarned = true
+            print('[drs_garages] ERROR: database readiness API is unavailable or incomplete; database-backed actions are disabled.')
         end
+
+        notifyDatabaseUnavailable(source)
+        return false, 'database readiness API is unavailable or incomplete'
     end
 
-    if type(databaseApi.wasSuccessful) == 'function' then
-        local resultOk, successful, detail = pcall(databaseApi.wasSuccessful)
+    local databaseOk, databaseUsable, databaseDetail = pcall(databaseApi.isUsable)
+    if not databaseOk or not databaseUsable then
+        notifyDatabaseUnavailable(source)
+        return false, databaseOk and databaseDetail or tostring(databaseUsable)
+    end
 
-        if not resultOk or not successful then
-            notifyDatabaseUnavailable(source)
-            return false, resultOk and detail or tostring(successful)
-        end
+    if not startupReconciliationComplete or not startupReconciliationSuccessful then
+        notifyDatabaseUnavailable(source)
+        return false, startupReconciliationDetail
     end
 
     return true
@@ -93,6 +193,69 @@ local function normalizePlate(plate)
     end
 
     return plate
+end
+
+local function getRetrievalOperation(plate)
+    return vehicleRetrievalOperations[plate]
+end
+
+local function beginRetrievalOperation(plate, source)
+    plate = normalizePlate(plate)
+    if not plate or vehicleStorageOperations[plate] or getRetrievalOperation(plate)
+        or vehicleExternalOperations[plate] or vehicleReconciliationQuarantine[plate]
+    then
+        return
+    end
+    if getActiveVehicleByPlate and getActiveVehicleByPlate(plate) then return end
+
+    local token = {}
+    vehicleRetrievalOperations[plate] = {
+        token = token,
+        source = tonumber(source)
+    }
+
+    return token
+end
+
+-- Contract ownership changes share the same plate-level exclusion domain as
+-- parking, garage takeout, impound retrieval, and companion registration.
+function BeginDrsGaragePlateOperation(rawPlate, source, operationName)
+    local plate = normalizePlate(rawPlate)
+
+    if not plate or vehicleStorageOperations[plate] or vehicleRetrievalOperations[plate]
+        or vehicleExternalOperations[plate] or vehicleReconciliationQuarantine[plate]
+    then
+        return
+    end
+
+    local token = {}
+    vehicleExternalOperations[plate] = {
+        token = token,
+        source = tonumber(source),
+        operation = tostring(operationName or 'external')
+    }
+
+    return token
+end
+
+function EndDrsGaragePlateOperation(rawPlate, token)
+    local plate = normalizePlate(rawPlate)
+    local operation = plate and vehicleExternalOperations[plate] or nil
+
+    if operation and operation.token == token then
+        vehicleExternalOperations[plate] = nil
+        return true
+    end
+
+    return false
+end
+
+local function endRetrievalOperation(plate, token)
+    local operation = vehicleRetrievalOperations[plate]
+
+    if operation and operation.token == token then
+        vehicleRetrievalOperations[plate] = nil
+    end
 end
 
 local function normalizeModelHash(value)
@@ -157,27 +320,186 @@ end
 local function normalizeGarageType(vehicleType)
     vehicleType = tostring(vehicleType or 'car'):lower()
 
-    if vehicleType == 'automobile' or vehicleType == 'bike' or vehicleType == 'bicycle' or vehicleType == 'quadbike' then
+    if vehicleType == 'automobile' or vehicleType == 'bike' or vehicleType == 'bicycle'
+        or vehicleType == 'quadbike' or vehicleType == 'trailer' or vehicleType == 'train'
+    then
         return 'car'
     elseif vehicleType == 'plane' or vehicleType == 'heli' or vehicleType == 'helicopter' then
         return 'air'
-    elseif vehicleType == 'jetski' then
+    elseif vehicleType == 'jetski' or vehicleType == 'submarine' or vehicleType == 'submarines' or vehicleType == 'submersible' then
         return 'boat'
     end
 
     return vehicleType
 end
 
+local publicStorageCatalog
+local publicStorageByType
+
+local function generatedPublicStorageName(garage)
+    local coords = garage.SpawnPosition or garage.Position or garage.PedPosition
+    if not coords then return end
+
+    local signature = ('%s|%.6f|%.6f|%.6f|%.6f'):format(
+        normalizeGarageType(garage.Type),
+        tonumber(coords.x) or 0.0,
+        tonumber(coords.y) or 0.0,
+        tonumber(coords.z) or 0.0,
+        tonumber(coords.w or coords.heading) or 0.0
+    )
+
+    return storageSafeGarageName(('drs_%s_%s%s'):format(
+        normalizeGarageType(garage.Type),
+        stableHash(signature),
+        stableHash(signature:reverse())
+    ))
+end
+
+local function publicGarageStorageName(garage)
+    if not garage then return end
+
+    local configured = garage.Garage or garage.Id or garage.ID or garage.StorageId or garage.Name or garage.Label
+
+    if isStorageSafeGarageName(configured) then
+        return tostring(configured):match('^%s*(.-)%s*$')
+    end
+
+    return generatedPublicStorageName(garage), configured
+end
+
+local function buildPublicStorageCatalog()
+    if publicStorageCatalog then return end
+
+    publicStorageCatalog = {}
+    publicStorageByType = {}
+
+    for index, garage in ipairs(Config.Garages or {}) do
+        local garageType = normalizeGarageType(garage.Type)
+        local storageName, invalidConfiguredName = publicGarageStorageName(garage)
+        local normalizedName = normalizeStorageName(storageName)
+
+        if invalidConfiguredName ~= nil then
+            storageWarningOnce(('invalid-public:%d'):format(index), ('Public garage config index %d has invalid storage id `%s`; a coordinate-derived id will be used.'):format(
+                index,
+                tostring(invalidConfiguredName)
+            ))
+        end
+
+        if normalizedName and normalizedName:sub(1, 9) == 'property_' then
+            storageWarningOnce(('reserved-public:%d'):format(index), ('Public garage config index %d uses reserved `property_` storage id `%s`; a coordinate-derived id will be used.'):format(
+                index,
+                storageName
+            ))
+            storageName = generatedPublicStorageName(garage)
+            normalizedName = normalizeStorageName(storageName)
+        end
+
+        if normalizedName then
+            garage.Garage = storageName
+
+            if publicStorageCatalog[normalizedName] then
+                publicStorageCatalogValid = false
+                storageWarningOnce(('duplicate-public:%s'):format(normalizedName), ('Public garage storage id `%s` is used more than once (latest config index %d). Non-global storage modes will remain disabled.'):format(
+                    storageName,
+                    index
+                ))
+            end
+
+            publicStorageCatalog[normalizedName] = garageType
+            publicStorageByType[garageType] = publicStorageByType[garageType] or {}
+            publicStorageByType[garageType][#publicStorageByType[garageType] + 1] = storageName
+        else
+            publicStorageCatalogValid = false
+            storageWarningOnce(('invalid-public:%d'):format(index), ('Public garage config index %d has no usable explicit id or coordinates; storage operations there will fail closed.'):format(index))
+        end
+    end
+end
+
+local function defaultStorageName(garageType)
+    garageType = normalizeGarageType(garageType)
+    buildPublicStorageCatalog()
+
+    local configuredDefaults = getStorageConfig().DefaultGarages
+    local configured = type(configuredDefaults) == 'table' and storageSafeGarageName(configuredDefaults[garageType]) or nil
+    local normalizedConfigured = normalizeStorageName(configured)
+
+    if normalizedConfigured and publicStorageCatalog[normalizedConfigured] == garageType then
+        return configured
+    end
+
+    local fallback = publicStorageByType[garageType] and publicStorageByType[garageType][1]
+
+    if configured and fallback then
+        storageWarningOnce(('invalid-default:%s'):format(garageType), ('Storage default `%s` is not a configured %s garage; using `%s`.'):format(
+            configured,
+            garageType,
+            fallback
+        ))
+    elseif not fallback then
+        storageWarningOnce(('missing-default:%s'):format(garageType), ('No public %s garage exists for legacy storage recovery.'):format(garageType))
+    end
+
+    return fallback
+end
+
+-- Publish every static garage's canonical id for diagnostics and companion
+-- integrations as soon as this server script loads.
+buildPublicStorageCatalog()
+
+local function countTableEntries(value)
+    local count = 0
+
+    for _ in pairs(type(value) == 'table' and value or {}) do
+        count = count + 1
+    end
+
+    return count
+end
+
+function GetDrsGaragesDiagnosticSnapshot()
+    buildPublicStorageCatalog()
+
+    local parkingOperationCount = countTableEntries(vehicleStorageOperations)
+    local retrievalOperationCount = countTableEntries(vehicleRetrievalOperations)
+    local externalOperationCount = countTableEntries(vehicleExternalOperations)
+
+    return {
+        requestedStorageMode = getRequestedStorageMode(),
+        storageMode = getStorageMode(),
+        activeVehicleCount = countTableEntries(activeVehicles),
+        propertyGarageCount = countTableEntries(propertyGarages),
+        storageOperationCount = parkingOperationCount + retrievalOperationCount + externalOperationCount,
+        parkingOperationCount = parkingOperationCount,
+        retrievalOperationCount = retrievalOperationCount,
+        externalOperationCount = externalOperationCount,
+        quarantinedVehicleCount = countTableEntries(vehicleReconciliationQuarantine),
+        reconciliationComplete = startupReconciliationComplete,
+        reconciliationSuccessful = startupReconciliationSuccessful,
+        reconciliationDetail = startupReconciliationDetail,
+        staticGarageCount = countTableEntries(Config.Garages),
+        staticGarageCatalogCount = countTableEntries(publicStorageCatalog),
+        staticGarageCatalogValid = publicStorageCatalogValid == true
+    }
+end
+
+exports('GetDrsGaragesDiagnosticSnapshot', GetDrsGaragesDiagnosticSnapshot)
+
 local function propertyGarageId(name)
-    local value = tostring(name or '')
+    if type(name) ~= 'string' and type(name) ~= 'number' then return end
+
+    local value = tostring(name):match('^%s*(.-)%s*$')
+    if not value or value == '' then return end
 
     if propertyGarages[value] then return value end
 
     value = value:lower():gsub('%s+', '_'):gsub('[^%w_%-]', '')
+    if value == '' then return end
 
     if value:sub(1, 9) ~= 'property_' then
         value = ('property_%s'):format(value)
     end
+
+    if value == 'property_' then return end
 
     return storageSafeGarageName(value)
 end
@@ -259,9 +581,15 @@ local function playerCanAccessGarage(player, garage)
     return garage.Owner == identifier or tableContains(garage.Keyholders, identifier)
 end
 
+local function isValidSocietyJobName(job)
+    return type(job) == 'string' and job ~= '' and job ~= 'unemployed'
+end
+
 local function vehicleMatchesOwnershipMode(vehicle, player, society)
     if society then
-        return vehicle.job and vehicle.job ~= '' and vehicle.job == player:getJob()
+        local job = player:getJob()
+        return isValidSocietyJobName(job)
+            and vehicle.job and vehicle.job ~= '' and vehicle.job == job
     end
 
     return not vehicle.job or vehicle.job == ''
@@ -274,20 +602,21 @@ local function canAccessGarage(source, garage)
     return playerCanAccessGarage(player, garage)
 end
 
-local function garageCoords(garage)
-    return garage.Position or garage.PedPosition or garage.SpawnPosition
+local function interactionRadius(configured)
+    local radius = tonumber(configured) or tonumber(Config.MaxDistance) or 10.0
+
+    if radius ~= radius or radius == math.huge or radius == -math.huge then radius = 10.0 end
+    return math.max(radius, 0.0) + SERVER_DISTANCE_TOLERANCE
 end
 
-local function isNearCoords(source, coords)
+local function isNearCoords(source, coords, radius)
     if not coords then return false end
 
     local playerPed = GetPlayerPed(source)
     if not playerPed or playerPed == 0 then return false end
 
     local playerCoords = GetEntityCoords(playerPed)
-    local distance = math.max(Config.MaxDistance or 10.0, 25.0)
-
-    return #(playerCoords - vector3(coords.x, coords.y, coords.z)) <= distance
+    return #(playerCoords - vector3(coords.x, coords.y, coords.z)) <= interactionRadius(radius)
 end
 
 local function isVehicleNearPlayer(source, vehicle)
@@ -299,32 +628,39 @@ local function isVehicleNearPlayer(source, vehicle)
 end
 
 local function isNearGarage(source, garage)
-    return isNearCoords(source, garageCoords(garage))
+    local radius = garage.Property and (Config.PropertyGarageDistance or 3.0) or Config.MaxDistance
+
+    return isNearCoords(source, garage.Position, radius)
+        or isNearCoords(source, garage.PedPosition, radius)
+        or (not garage.Position and not garage.PedPosition and isNearCoords(source, garage.SpawnPosition, radius))
 end
 
 local function isNearGarageParking(source, garage)
     if garage.Property and garage.SpawnPosition then
-        return isNearCoords(source, garage.SpawnPosition)
+        return isNearCoords(
+            source,
+            garage.SpawnPosition,
+            Config.PropertyGarageParkingDistance or Config.PropertyGarageDistance or 3.0
+        )
     end
 
     return isNearGarage(source, garage)
 end
 
-local function garageParkingCoords(garage)
-    if garage.Property and garage.SpawnPosition then
-        return garage.SpawnPosition
+local function isVehicleNearGarageParking(vehicle, garage)
+    if not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) then return false end
+
+    local vehicleCoords = GetEntityCoords(vehicle)
+    local radius = garage.Property
+        and (Config.PropertyGarageParkingDistance or Config.PropertyGarageDistance or 3.0)
+        or Config.MaxDistance
+    local maximumDistance = interactionRadius(radius)
+    local function near(coords)
+        return coords and #(vehicleCoords - vector3(coords.x, coords.y, coords.z)) <= maximumDistance
     end
 
-    return garageCoords(garage)
-end
-
-local function isVehicleNearGarageParking(vehicle, garage)
-    local coords = garageParkingCoords(garage)
-    if not coords or not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) then return false end
-
-    local distance = math.max(Config.MaxDistance or 10.0, 25.0)
-
-    return #(GetEntityCoords(vehicle) - vector3(coords.x, coords.y, coords.z)) <= distance
+    if garage.Property then return near(garage.SpawnPosition or garage.Position or garage.PedPosition) end
+    return near(garage.Position) or near(garage.PedPosition) or near(garage.SpawnPosition)
 end
 
 local function spawnTypeMatchesGarage(spawnType, garage)
@@ -351,6 +687,7 @@ local function validateVehicleForStorage(source, garage, netId, plate, model, ex
     if GetEntityType(entity) ~= 2 then return end
     if NetworkGetNetworkIdFromEntity(entity) ~= netId then return end
     if GetPlayerRoutingBucket(source) ~= GetEntityRoutingBucket(entity) then return end
+    if GetPedInVehicleSeat(entity, -1) ~= GetPlayerPed(source) then return end
     if not isVehicleNearGarageParking(entity, garage) then return end
     if not liveVehicleTypeMatchesGarage(entity, garage) then return end
     if normalizePlate(GetVehicleNumberPlateText(entity)) ~= plate then return end
@@ -359,7 +696,7 @@ local function validateVehicleForStorage(source, garage, netId, plate, model, ex
     return entity
 end
 
-local function getActiveVehicleByPlate(plate)
+getActiveVehicleByPlate = function(plate)
     local entity = activeVehicles[plate]
 
     if entity then
@@ -382,6 +719,45 @@ local function getActiveVehicleByPlate(plate)
     end
 end
 
+local function findContractVehicle(source, plate)
+    local entity = getActiveVehicleByPlate(plate)
+    local playerPed = GetPlayerPed(source)
+
+    if not entity or not DoesEntityExist(entity) or GetEntityType(entity) ~= 2 then return end
+    if not playerPed or playerPed == 0 or not DoesEntityExist(playerPed) then return end
+    if GetPlayerRoutingBucket(source) ~= GetEntityRoutingBucket(entity) then return end
+    if normalizePlate(GetVehicleNumberPlateText(entity)) ~= plate then return end
+
+    local contractDistance = type(Config.Contract) == 'table' and Config.Contract.VehicleDistance or 5.0
+    if #(GetEntityCoords(playerPed) - GetEntityCoords(entity)) > interactionRadius(contractDistance) then return end
+
+    return entity
+end
+
+function InspectDrsGarageContractVehicle(source, rawPlate)
+    source = tonumber(source)
+    local plate = normalizePlate(rawPlate)
+
+    if not source or not plate or vehicleStorageOperations[plate]
+        or vehicleRetrievalOperations[plate] or vehicleExternalOperations[plate]
+    then
+        return
+    end
+
+    return findContractVehicle(source, plate)
+end
+
+function ValidateDrsGarageContractVehicle(source, rawPlate, token)
+    source = tonumber(source)
+    local plate = normalizePlate(rawPlate)
+    local operation = plate and vehicleExternalOperations[plate] or nil
+
+    if not source or not plate or not operation or operation.token ~= token or operation.source ~= source then return end
+    if vehicleStorageOperations[plate] or vehicleRetrievalOperations[plate] then return end
+
+    return findContractVehicle(source, plate)
+end
+
 local function isExactActiveVehicle(plate, entity)
     getActiveVehicleByPlate(plate)
 
@@ -391,18 +767,49 @@ end
 local function isVehicleStorageInProgress(plate)
     plate = normalizePlate(plate)
 
-    return plate and vehicleStorageOperations[plate] ~= nil or false
+    return plate and (
+        vehicleStorageOperations[plate] ~= nil
+        or getRetrievalOperation(plate) ~= nil
+        or vehicleExternalOperations[plate] ~= nil
+        or vehicleReconciliationQuarantine[plate] ~= nil
+    ) or false
 end
 
-local function deleteRegisteredVehicle(plate, entity, netId)
+local function requestVehicleDeletion(entity)
+    if not entity or entity == 0 or not DoesEntityExist(entity) then return true end
+
+    if GetResourceState('qbx_core') == 'started' then
+        local qboxDeleteOk, qboxDeleteResult = pcall(function()
+            -- Qbox clears the persisted state before deletion. Using the raw
+            -- native alone can make a semi-persisted vehicle respawn.
+            return exports.qbx_core:DeleteVehicle(entity)
+        end)
+
+        if not qboxDeleteOk or qboxDeleteResult == false then
+            local stateReadOk, persisted = pcall(function()
+                return Entity(entity).state.persisted == true
+            end)
+
+            if not stateReadOk or persisted then
+                return not DoesEntityExist(entity)
+            end
+        end
+    end
+
+    if DoesEntityExist(entity) then DeleteEntity(entity) end
+    return true
+end
+
+local function deleteRegisteredVehicle(source, plate, entity, netId)
     netId = tonumber(netId)
 
     for _ = 1, VEHICLE_DELETE_RETRY_COUNT do
         if not DoesEntityExist(entity) then return true end
         if vehicleStorageOperations[plate] ~= entity or activeVehicles[plate] ~= entity then return false end
         if NetworkGetNetworkIdFromEntity(entity) ~= netId then return false end
+        if GetPedInVehicleSeat(entity, -1) ~= GetPlayerPed(source) then return false end
 
-        DeleteEntity(entity)
+        if not requestVehicleDeletion(entity) then return not DoesEntityExist(entity) end
 
         if not DoesEntityExist(entity) then return true end
 
@@ -410,6 +817,52 @@ local function deleteRegisteredVehicle(plate, entity, netId)
     end
 
     return not DoesEntityExist(entity)
+end
+
+local function deleteSpawnedVehicle(entity)
+    if not entity or entity == 0 then return true end
+
+    for _ = 1, VEHICLE_DELETE_RETRY_COUNT do
+        if not DoesEntityExist(entity) then return true end
+
+        if not requestVehicleDeletion(entity) then return not DoesEntityExist(entity) end
+        if not DoesEntityExist(entity) then return true end
+
+        Wait(VEHICLE_DELETE_RETRY_INTERVAL)
+    end
+
+    return not DoesEntityExist(entity)
+end
+
+local function deleteDestroyedActiveVehicle(plate, entity)
+    plate = normalizePlate(plate)
+
+    if not plate or not entity or entity == 0 then return false end
+    if isVehicleStorageInProgress(plate) or activeVehicles[plate] ~= entity then return false end
+
+    vehicleStorageOperations[plate] = entity
+    local deleted = deleteSpawnedVehicle(entity)
+
+    if deleted and activeVehicles[plate] == entity then
+        activeVehicles[plate] = nil
+    end
+
+    if vehicleStorageOperations[plate] == entity then
+        vehicleStorageOperations[plate] = nil
+    end
+
+    return deleted
+end
+
+local function awaitVehicleOwner(entity)
+    local deadline = GetGameTimer() + VEHICLE_OWNER_TIMEOUT
+
+    while DoesEntityExist(entity) and GetGameTimer() < deadline do
+        local owner = NetworkGetEntityOwner(entity)
+        if owner and owner > 0 then return owner end
+
+        Wait(0)
+    end
 end
 
 local function clientGarageData(garage)
@@ -422,6 +875,21 @@ local function clientGarageData(garage)
         Property = true,
         Visible = false
     }
+end
+
+function BuildDrsGarageClientVehicles(vehicles)
+    local clientVehicles = {}
+
+    for _, storedVehicle in ipairs(type(vehicles) == 'table' and vehicles or {}) do
+        clientVehicles[#clientVehicles + 1] = {
+            plate = storedVehicle.plate,
+            mods = storedVehicle.mods,
+            vehicle = storedVehicle.vehicle,
+            state = storedVehicle.state
+        }
+    end
+
+    return clientVehicles
 end
 
 local function refreshPropertyGarageForPlayer(source, id)
@@ -536,6 +1004,37 @@ lib.callback.register('drs_garages:getPropertyGarages', function(source)
 end)
 
 
+local function applyVehicleIdentityState(entity, storedVehicle)
+    if not entity or entity == 0 or not DoesEntityExist(entity) then return false end
+
+    local ok, errorMessage = pcall(function()
+        local state = Entity(entity).state
+        local vehicleId = tonumber(storedVehicle and storedVehicle.id)
+        local plate = normalizePlate(storedVehicle and storedVehicle.plate)
+
+        state:set('drsGarageManaged', true, false)
+        if plate then state:set('drsGaragePlate', plate, false) end
+        if vehicleId then state:set('drsGarageRowId', vehicleId, false) end
+
+        if Framework.name == 'qbx_core' then
+            local personal = storedVehicle and (storedVehicle.job == nil or storedVehicle.job == '')
+            local owner = personal and storedVehicle.citizenid or nil
+
+            if vehicleId then state:set('vehicleid', vehicleId, false) end
+            state:set('owner', type(owner) == 'string' and owner ~= '' and owner or nil, true)
+        end
+    end)
+
+    if not ok then
+        print(('[drs_garages] WARNING: Could not apply managed vehicle identity state to entity %s: %s'):format(
+            tostring(entity),
+            tostring(errorMessage)
+        ))
+    end
+
+    return ok
+end
+
 local function giveVehicleKeys(source, vehicle)
     if not Config.UseKeySystem then return end
     if not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) then return end
@@ -545,7 +1044,10 @@ local function giveVehicleKeys(source, vehicle)
         return
     end
 
-    -- qb-vehiclekeys is client/event based in most installs, so leave it to config/cl_edit.lua.
+    if GetResourceState('qb-vehiclekeys') == 'started' then
+        local plate = normalizePlate(GetVehicleNumberPlateText(vehicle))
+        if plate then exports['qb-vehiclekeys']:GiveKeys(source, plate) end
+    end
 end
 
 ---@param source number Player server id that owns the persisted vehicle.
@@ -563,7 +1065,7 @@ local function RegisterActiveVehicle(source, plate, netId)
     if not source or source < 1 then return false, 'invalid_source' end
     if not plate then return false, 'invalid_plate' end
     if not netId or netId < 1 or netId % 1 ~= 0 then return false, 'invalid_net_id' end
-    if vehicleStorageOperations[plate] then return false, 'storage_in_progress' end
+    if isVehicleStorageInProgress(plate) then return false, 'storage_in_progress' end
 
     local player = Framework.getPlayerFromId(source)
     if not player then return false, 'player_not_found' end
@@ -584,6 +1086,11 @@ local function RegisterActiveVehicle(source, plate, netId)
     local entityPlate = normalizePlate(GetVehicleNumberPlateText(entity))
     if entityPlate ~= plate then return false, 'plate_mismatch' end
 
+    local registrationToken = beginRetrievalOperation(plate, source)
+    if not registrationToken then return false, 'storage_in_progress' end
+
+    local function performRegistration()
+
     local storedVehicle = MySQL.single.await(Queries.getVehicleStrict, {
         identifier,
         plate
@@ -601,8 +1108,8 @@ local function RegisterActiveVehicle(source, plate, netId)
     end
 
     if databaseInteger(storedVehicle.stored) ~= 0 then return false, 'vehicle_not_out' end
-    if (Framework.name == 'qb-core' or Framework.name == 'qbx_core') and databaseInteger(storedVehicle.state) ~= 0 then
-        return false, 'vehicle_not_out'
+    if Framework.name == 'qb-core' or Framework.name == 'qbx_core' then
+        if databaseInteger(storedVehicle.state) ~= 0 then return false, 'vehicle_not_out' end
     end
 
     -- The ownership lookup yields to the database. Re-resolve and revalidate the
@@ -644,9 +1151,27 @@ local function RegisterActiveVehicle(source, plate, netId)
         end
     end
 
+    if not applyVehicleIdentityState(currentEntity, storedVehicle) then
+        return false, 'identity_state_failed'
+    end
+
     activeVehicles[plate] = currentEntity
 
     return true, 'registered'
+    end
+
+    local operationOk, success, reason = xpcall(performRegistration, function(errorMessage)
+        return debug.traceback(errorMessage, 2)
+    end)
+
+    endRetrievalOperation(plate, registrationToken)
+
+    if not operationOk then
+        print(('[drs_garages] Unexpected active-vehicle registration error for plate %s: %s'):format(plate, tostring(success)))
+        return false, 'unexpected_error'
+    end
+
+    return success, reason
 end
 
 ---@param plate string Persisted vehicle plate.
@@ -656,7 +1181,7 @@ end
 local function UnregisterActiveVehicle(plate, netId)
     plate = normalizePlate(plate)
     if not plate then return false, 'invalid_plate' end
-    if vehicleStorageOperations[plate] then return false, 'storage_in_progress' end
+    if isVehicleStorageInProgress(plate) then return false, 'storage_in_progress' end
 
     if netId ~= nil then
         netId = tonumber(netId)
@@ -690,11 +1215,26 @@ end)
 
 AddEventHandler('playerDropped', function()
     databaseNotificationTimes[source] = nil
+    -- A yielded callback still owns its exact token after disconnect. Its
+    -- post-yield identity checks fail closed and its finally path releases the
+    -- token; clearing it here would reopen the plate to a concurrent operation.
+end)
+
+AddEventHandler('onResourceStop', function(resource)
+    if resource ~= GetCurrentResourceName() then return end
+
+    -- Retrieval tokens intentionally never expire while their callback is live.
+    -- Explicitly discard them on shutdown as the other safe terminal condition.
+    vehicleRetrievalOperations = {}
+    vehicleStorageOperations = {}
+    vehicleExternalOperations = {}
+    vehicleReconciliationQuarantine = {}
 end)
 
 local function invalidIndexMessage(kind, source, index)
     print(('[drs_garages] Invalid %s index from source %s: %s'):format(kind, source or 'unknown', tostring(index)))
-    TriggerClientEvent('drs_garages:showNotification', source, ('Invalid %s location. Check your garage config/client args.'):format(kind), 'error')
+    local localeKey = kind == 'impound' and 'invalid_impound' or 'invalid_garage'
+    TriggerClientEvent('drs_garages:showNotification', source, locale(localeKey), 'error')
 end
 
 local function garageStorageName(index, garage)
@@ -704,10 +1244,399 @@ local function garageStorageName(index, garage)
         return storageSafeGarageName(index)
     end
 
-    return storageSafeGarageName(garage.Garage or garage.Name or garage.Label)
+    return publicGarageStorageName(garage)
+end
+
+local function isPropertyStorageName(value)
+    value = normalizeStorageName(value)
+
+    return value and value:sub(1, 9) == 'property_' or false
+end
+
+local function getAssignedPropertyGarage(value)
+    value = normalizeStorageName(value)
+    if not value then return end
+    if propertyGarages[value] then return propertyGarages[value] end
+
+    for id, garage in pairs(propertyGarages) do
+        if normalizeStorageName(id) == value then return garage end
+    end
+end
+
+local function rowHasStorageState(vehicle, stored)
+    if databaseInteger(vehicle and vehicle.stored) ~= stored then return false end
+
+    if Framework.name == 'qb-core' or Framework.name == 'qbx_core' then
+        local frameworkState = databaseInteger(vehicle.state)
+        if stored == 0 then return frameworkState == 0 or frameworkState == 2 end
+        return frameworkState == 1
+    end
+
+    return true
+end
+
+local function rowTypeMatchesGarage(vehicle, garage)
+    if Framework.name == 'es_extended' and (not vehicle or type(vehicle.type) ~= 'string' or vehicle.type == '') then
+        -- Stock ESX schemas do not guarantee a type column. The spawned entity is
+        -- validated against the requested garage before its claimed row can stay out.
+        return true
+    end
+
+    return normalizeGarageType(vehicle and vehicle.type or 'car') == normalizeGarageType(garage and garage.Type)
+end
+
+local function vehicleVisibleAtGarage(vehicle, index, garage, player, society)
+    if not vehicle or not garage or not player or not rowTypeMatchesGarage(vehicle, garage) then return false end
+
+    local mode = getStorageMode()
+    if mode == 'global' then return true end
+
+    local targetName = normalizeStorageName(garageStorageName(index, garage))
+    if not targetName then return false end
+
+    local assignedName = normalizeStorageName(vehicle.garage)
+    local assignedIsProperty = isPropertyStorageName(assignedName)
+
+    if mode == 'property' then
+        if garage.Property then
+            return assignedName == targetName
+        end
+
+        if not assignedIsProperty then return true end
+        if not recoveryEnabled('RecoverInaccessibleProperties') then return false end
+
+        local assignedProperty = getAssignedPropertyGarage(assignedName)
+
+        return society == true or not assignedProperty or not playerCanAccessGarage(player, assignedProperty)
+    end
+
+    if assignedName == targetName then return true end
+
+    if assignedIsProperty then
+        local assignedProperty = getAssignedPropertyGarage(assignedName)
+
+        if assignedProperty and society ~= true and playerCanAccessGarage(player, assignedProperty) then
+            return false
+        end
+
+        if not recoveryEnabled('RecoverInaccessibleProperties') then return false end
+    else
+        buildPublicStorageCatalog()
+
+        if assignedName and publicStorageCatalog[assignedName] then return false end
+        if not recoveryEnabled('RecoverUnassigned') then return false end
+    end
+
+    return targetName == normalizeStorageName(defaultStorageName(vehicle.type or garage.Type))
+end
+
+function FilterDrsGarageVehicles(source, index, vehicles, society)
+    local player = Framework.getPlayerFromId(source)
+    local garage = getGarage(index)
+    if not player or not garage or not playerCanAccessGarage(player, garage) then return {} end
+
+    local filtered = {}
+
+    for _, vehicle in ipairs(type(vehicles) == 'table' and vehicles or {}) do
+        if vehicleVisibleAtGarage(vehicle, index, garage, player, society == true) then
+            filtered[#filtered + 1] = vehicle
+        end
+    end
+
+    return filtered
+end
+
+function GetDrsGarageExitPosition(source, index)
+    local player = Framework.getPlayerFromId(source)
+    local garage = getGarage(index)
+
+    if not player or not garage or not playerCanAccessGarage(player, garage) then return end
+
+    return vecToTable(garage.Position or garage.PedPosition or garage.SpawnPosition)
+end
+
+local function queryStrictVehicle(player, plate, society, stored)
+    local query
+    local params
+
+    if society then
+        local job = player:getJob()
+        if not isValidSocietyJobName(job) then return end
+
+        query = stored and Queries.getStoredVehicleSociety or Queries.getOutVehicleSociety
+        params = { job, plate }
+    else
+        query = stored and Queries.getStoredVehiclePersonal or Queries.getOutVehiclePersonal
+        params = { player:getIdentifier(), plate }
+    end
+
+    local ok, vehicle = pcall(MySQL.single.await, query, params)
+    if not ok then
+        print(('[drs_garages] Vehicle lookup failed for plate %s: %s'):format(plate, tostring(vehicle)))
+        return
+    end
+
+    return vehicle
+end
+
+
+local function transitionVehicleStorageState(vehicle, ownershipMode, identifier, job, expected, target)
+    local isQb = Framework.name == 'qb-core' or Framework.name == 'qbx_core'
+    local tableName = isQb and 'player_vehicles' or 'owned_vehicles'
+    local where = {}
+    local params = { target }
+
+    if isQb then params[#params + 1] = target end
+
+    if vehicle.id ~= nil then
+        where[#where + 1] = '`id` = ?'
+        params[#params + 1] = vehicle.id
+    end
+
+    if ownershipMode == 'society' then
+        where[#where + 1] = '`job` = ?'
+        params[#params + 1] = job
+    else
+        where[#where + 1] = isQb and '`citizenid` = ?' or '`owner` = ?'
+        params[#params + 1] = identifier
+        where[#where + 1] = '`job` IS NULL'
+    end
+
+    where[#where + 1] = '`plate` = ?'
+    params[#params + 1] = vehicle.plate
+    where[#where + 1] = '`stored` = ?'
+    params[#params + 1] = expected
+
+    if isQb then
+        where[#where + 1] = '`state` = ?'
+        params[#params + 1] = expected
+    end
+
+    local setClause = isQb and '`stored` = ?, `state` = ?' or '`stored` = ?'
+    local sql = ('UPDATE `%s` SET %s WHERE %s LIMIT 1'):format(tableName, setClause, table.concat(where, ' AND '))
+    local ok, changed = pcall(MySQL.update.await, sql, params)
+
+    if not ok then
+        print(('[drs_garages] Storage transition failed for plate %s: %s'):format(tostring(vehicle.plate), tostring(changed)))
+        return false
+    end
+
+    return tonumber(changed) == 1
+end
+
+local function decodeStoredVehicleProperties(vehicle, plate)
+    local ok, props = pcall(json.decode, vehicle.mods or vehicle.vehicle)
+    if not ok or type(props) ~= 'table' or not normalizeModelHash(props.model) then return end
+
+    props.plate = plate
+    return props
+end
+
+local function readBoundedVehicleValue(nativeName, entity, minimum, maximum)
+    local getter = rawget(_G, nativeName)
+    if type(getter) ~= 'function' then return end
+
+    local ok, value = pcall(getter, entity)
+    value = ok and tonumber(value) or nil
+    if not value or value ~= value or value == math.huge or value == -math.huge then return end
+
+    return math.min(math.max(value, minimum), maximum)
+end
+
+local function buildTrustedParkingProperties(storedVehicle, entity, plate)
+    local trusted = decodeStoredVehicleProperties(storedVehicle, plate)
+    if not trusted then return end
+
+    -- Cosmetic/performance modifications remain database-authoritative. The
+    -- parking callback is client-callable, so only bounded values read from the
+    -- exact server entity may refresh volatile condition fields.
+    local runtimeFields = {
+        engineHealth = { 'GetVehicleEngineHealth', -4000.0, 1000.0 },
+        bodyHealth = { 'GetVehicleBodyHealth', 0.0, 1000.0 },
+        tankHealth = { 'GetVehiclePetrolTankHealth', -1000.0, 1000.0 },
+        dirtLevel = { 'GetVehicleDirtLevel', 0.0, 15.0 },
+        fuelLevel = { 'GetVehicleFuelLevel', 0.0, 100.0 }
+    }
+
+    for property, definition in pairs(runtimeFields) do
+        local value = readBoundedVehicleValue(definition[1], entity, definition[2], definition[3])
+        if value ~= nil then trusted[property] = value end
+    end
+
+    trusted.plate = plate
+    return trusted
+end
+
+local VALID_SERVER_SETTER_TYPES = {
+    automobile = true,
+    bike = true,
+    boat = true,
+    heli = true,
+    plane = true,
+    submarine = true,
+    trailer = true,
+    train = true
+}
+local SETTER_TYPE_EXCEPTIONS = {
+    airtug = 'automobile',
+    avisa = 'submarine',
+    blimp = 'heli',
+    blimp2 = 'heli',
+    blimp3 = 'heli',
+    caddy = 'automobile',
+    caddy2 = 'automobile',
+    caddy3 = 'automobile',
+    chimera = 'automobile',
+    docktug = 'automobile',
+    forklift = 'automobile',
+    kosatka = 'submarine',
+    mower = 'automobile',
+    policeb = 'bike',
+    ripley = 'automobile',
+    rrocket = 'automobile',
+    sadler = 'automobile',
+    sadler2 = 'automobile',
+    scrap = 'automobile',
+    slamtruck = 'automobile',
+    stryder = 'automobile',
+    submersible = 'submarine',
+    submersible2 = 'submarine',
+    thruster = 'heli',
+    towtruck = 'automobile',
+    towtruck2 = 'automobile',
+    tractor = 'automobile',
+    tractor2 = 'automobile',
+    tractor3 = 'automobile',
+    trailersmall2 = 'trailer',
+    utillitruck = 'automobile',
+    utillitruck2 = 'automobile',
+    utillitruck3 = 'automobile'
+}
+local setterTypeByModelHash
+
+local function cacheSetterMetadataEntry(key, metadata)
+    if type(metadata) ~= 'table' then return end
+
+    local setterType = tostring(metadata.type or ''):lower()
+    if not VALID_SERVER_SETTER_TYPES[setterType] then return end
+
+    local modelHash = normalizeModelHash(metadata.hash or metadata.model or key)
+    if modelHash then setterTypeByModelHash[modelHash] = setterType end
+end
+
+local function loadSetterTypeMetadata()
+    if setterTypeByModelHash then return end
+
+    setterTypeByModelHash = {}
+
+    if Framework.name == 'qbx_core' then
+        local byHashOk, byHash = pcall(function() return exports.qbx_core:GetVehiclesByHash() end)
+        local byNameOk, byName = pcall(function() return exports.qbx_core:GetVehiclesByName() end)
+
+        for key, metadata in pairs(byHashOk and type(byHash) == 'table' and byHash or {}) do
+            cacheSetterMetadataEntry(key, metadata)
+        end
+
+        for key, metadata in pairs(byNameOk and type(byName) == 'table' and byName or {}) do
+            cacheSetterMetadataEntry(key, metadata)
+        end
+    elseif Framework.name == 'qb-core' then
+        local vehicles = type(QBCore) == 'table' and QBCore.Shared and QBCore.Shared.Vehicles or nil
+
+        for key, metadata in pairs(type(vehicles) == 'table' and vehicles or {}) do
+            cacheSetterMetadataEntry(key, metadata)
+        end
+    end
+
+    for modelName, setterType in pairs(SETTER_TYPE_EXCEPTIONS) do
+        local modelHash = normalizeModelHash(modelName)
+        if modelHash then setterTypeByModelHash[modelHash] = setterType end
+    end
+end
+
+local function metadataSetterType(model)
+    loadSetterTypeMetadata()
+    return setterTypeByModelHash[normalizeModelHash(model)]
+end
+
+local function trustedSetterType(requestedType, vehicle, model)
+    local requested = tostring(requestedType or ''):lower()
+    local hasStoredType = vehicle and type(vehicle.type) == 'string' and vehicle.type ~= ''
+    local storedType = hasStoredType and tostring(vehicle.type):lower() or false
+    local garageType = Framework.name == 'es_extended' and not hasStoredType
+        and normalizeGarageType(requested)
+        or normalizeGarageType(vehicle and vehicle.type or 'car')
+
+    if normalizeGarageType(requested) ~= garageType then return end
+
+    -- The model exception table is folded into metadataSetterType and is
+    -- authoritative. Otherwise prefer the client-derived native subtype over
+    -- framework metadata, which is often only a broad service category.
+    local modelType = metadataSetterType(model)
+    local exceptionType
+    for modelName, setterType in pairs(SETTER_TYPE_EXCEPTIONS) do
+        if normalizeModelHash(modelName) == normalizeModelHash(model) then
+            exceptionType = setterType
+            break
+        end
+    end
+
+    local candidates = { exceptionType or false, requested, modelType or false, storedType }
+    for index = 1, #candidates do
+        local setterType = candidates[index]
+
+        if VALID_SERVER_SETTER_TYPES[setterType] and normalizeGarageType(setterType) == garageType then
+            return setterType
+        end
+    end
+
+    if garageType == 'car' then
+        if requested == 'bike' or requested == 'bicycle' then return 'bike' end
+        if requested == 'automobile' or requested == 'quadbike' then return 'automobile' end
+    elseif garageType == 'boat' then
+        if requested == 'submarine' or requested == 'submersible' then return 'submarine' end
+        if requested == 'boat' or requested == 'jetski' then return 'boat' end
+    elseif garageType == 'air' and (requested == 'plane' or requested == 'heli' or requested == 'helicopter') then
+        return requested == 'plane' and 'plane' or 'heli'
+    end
+end
+
+local function spawnStoredVehicle(vehicle, garage, plate, requestedType)
+    local props = decodeStoredVehicleProperties(vehicle, plate)
+    local setterType = props and trustedSetterType(requestedType, vehicle, props.model) or nil
+    if not setterType or not props then return nil, nil, nil, true end
+
+    local ok, entity = pcall(Utils.createVehicle, props.model, garage.SpawnPosition, setterType)
+
+    if not ok or not entity or entity == 0 or not DoesEntityExist(entity) then
+        local deleted = not entity or entity == 0 or not DoesEntityExist(entity) or deleteSpawnedVehicle(entity)
+        if not deleted and entity and DoesEntityExist(entity) then activeVehicles[plate] = entity end
+        return nil, nil, nil, deleted
+    end
+
+    local modelMatches, hasStoredModel = vehicleMatchesStoredModel(entity, vehicle)
+
+    if not hasStoredModel or not modelMatches or not liveVehicleTypeMatchesGarage(entity, garage) then
+        local deleted = deleteSpawnedVehicle(entity)
+        if not deleted and DoesEntityExist(entity) then activeVehicles[plate] = entity end
+        return nil, nil, nil, deleted
+    end
+
+    local owner = awaitVehicleOwner(entity)
+
+    if owner == nil then
+        local deleted = deleteSpawnedVehicle(entity)
+        if not deleted and DoesEntityExist(entity) then activeVehicles[plate] = entity end
+        return nil, nil, nil, deleted
+    end
+
+    return entity, owner, props, true
 end
 
 local function setVehicleStored(plate, stored, garageName)
+    plate = normalizePlate(plate)
+    if not plate then return end
+
     stored = databaseInteger(stored) or 0
 
     if Framework.name == 'qb-core' or Framework.name == 'qbx_core' then
@@ -730,94 +1659,287 @@ local function setVehicleStored(plate, stored, garageName)
     return MySQL.update.await(Queries.setStoredVehicle, { stored, plate })
 end
 
+local function reconciliationCandidateIsTrusted(entity, storedVehicle)
+    if GetEntityRoutingBucket(entity) ~= 0 then return false, 'entity is not in routing bucket 0' end
+
+    local stateOk, state = pcall(function()
+        local entityState = Entity(entity).state
+
+        return {
+            managed = entityState.drsGarageManaged,
+            plate = entityState.drsGaragePlate,
+            rowId = entityState.drsGarageRowId,
+            vehicleId = entityState.vehicleid,
+            owner = entityState.owner
+        }
+    end)
+
+    if not stateOk then return false, 'entity identity state could not be read' end
+
+    local plate = normalizePlate(storedVehicle.plate)
+    local storedId = tonumber(storedVehicle.id)
+
+    if state.plate ~= nil and normalizePlate(state.plate) ~= plate then
+        return false, 'managed plate marker conflicts with the database row'
+    end
+
+    if state.rowId ~= nil and (not storedId or tonumber(state.rowId) ~= storedId) then
+        return false, 'managed row marker conflicts with the database row'
+    end
+
+    if Framework.name == 'qbx_core' and state.vehicleId ~= nil
+        and (not storedId or tonumber(state.vehicleId) ~= storedId)
+    then
+        return false, 'Qbox vehicleid conflicts with the database row'
+    end
+
+    local personalOwner = storedVehicle.job == nil or storedVehicle.job == ''
+    if Framework.name == 'qbx_core' and personalOwner and state.owner ~= nil
+        and tostring(state.owner) ~= tostring(storedVehicle.citizenid)
+    then
+        return false, 'Qbox owner marker conflicts with the database row'
+    end
+
+    local exactManagedMarker = state.managed == true
+        and state.plate ~= nil
+        and normalizePlate(state.plate) == plate
+        and (not storedId or tonumber(state.rowId) == storedId)
+    local exactQboxVehicleId = Framework.name == 'qbx_core'
+        and storedId ~= nil
+        and tonumber(state.vehicleId) == storedId
+
+    if not exactManagedMarker and not exactQboxVehicleId then
+        return false, 'entity has no exact server-managed row identity marker'
+    end
+
+    return true
+end
+
 
 ---@async
 local function moveOutVehiclesIntoGarages(returnMissing)
-    if Framework.name == 'qb-core' or Framework.name == 'qbx_core' then
-        local outVehicles = MySQL.query.await([[
+    local isQb = Framework.name == 'qb-core' or Framework.name == 'qbx_core'
+    local outVehicles
+
+    if isQb then
+        outVehicles = MySQL.query.await([[
             SELECT *
             FROM player_vehicles
-            WHERE `stored` = 0 OR `state` = 0
-        ]]) or {}
-        local worldVehicles = {}
+            WHERE `stored` = 0 OR `state` IN (0, 2)
+        ]])
+    else
+        outVehicles = MySQL.query.await([[
+            SELECT *
+            FROM owned_vehicles
+            WHERE `stored` = 0
+        ]])
+    end
 
-        for _, entity in ipairs(GetAllVehicles()) do
-            if entity and entity ~= 0 and DoesEntityExist(entity) and GetEntityType(entity) == 2 then
-                local plate = normalizePlate(GetVehicleNumberPlateText(entity))
+    if type(outVehicles) ~= 'table' then
+        error('startup reconciliation vehicle query did not return a table')
+    end
 
-                if plate then
-                    worldVehicles[plate] = worldVehicles[plate] or {}
-                    worldVehicles[plate][#worldVehicles[plate] + 1] = entity
+    local worldVehicles = {}
+
+    for _, entity in ipairs(GetAllVehicles()) do
+        if entity and entity ~= 0 and DoesEntityExist(entity) and GetEntityType(entity) == 2 then
+            local plate = normalizePlate(GetVehicleNumberPlateText(entity))
+
+            if plate then
+                worldVehicles[plate] = worldVehicles[plate] or {}
+                worldVehicles[plate][#worldVehicles[plate] + 1] = entity
+            end
+        end
+    end
+
+    local recovered = 0
+    local returned = 0
+    local preservedImpounds = 0
+    local quarantined = 0
+
+    for _, storedVehicle in ipairs(outVehicles) do
+        local normalizedPlate = normalizePlate(storedVehicle.plate)
+        local candidates = normalizedPlate and worldVehicles[normalizedPlate] or nil
+        local matchingEntities = {}
+
+        for _, entity in ipairs(candidates or {}) do
+            if DoesEntityExist(entity) then
+                local modelMatches, hasStoredModel = vehicleMatchesStoredModel(entity, storedVehicle)
+
+                if hasStoredModel and modelMatches then
+                    matchingEntities[#matchingEntities + 1] = entity
                 end
             end
         end
 
-        local recovered = 0
-        local returned = 0
+        local quarantineReason
 
-        for _, storedVehicle in ipairs(outVehicles) do
-            local normalizedPlate = normalizePlate(storedVehicle.plate)
-            local candidates = normalizedPlate and worldVehicles[normalizedPlate] or nil
-            local liveEntity = nil
+        if #matchingEntities > 1 then
+            quarantineReason = 'multiple live entities match the stored plate/model'
+        end
 
-            for _, entity in ipairs(candidates or {}) do
-                if DoesEntityExist(entity) then
-                    local modelMatches, hasStoredModel = vehicleMatchesStoredModel(entity, storedVehicle)
+        if #matchingEntities == 0 and #(candidates or {}) > 0 then
+            quarantineReason = 'a live entity uses the stored plate but has a different model'
+        end
 
-                    if hasStoredModel and modelMatches then
-                        liveEntity = entity
-                        break
-                    end
-                end
-            end
+        local liveEntity = matchingEntities[1]
 
-            if liveEntity then
-                activeVehicles[storedVehicle.plate] = liveEntity
-                setVehicleStored(storedVehicle.plate, 0)
-                recovered = recovered + 1
-            elseif returnMissing then
-                setVehicleStored(storedVehicle.plate, 1)
-                returned = returned + 1
+        if liveEntity and not quarantineReason then
+            local trusted, reason = reconciliationCandidateIsTrusted(liveEntity, storedVehicle)
+            if not trusted then quarantineReason = reason end
+        end
+
+        if liveEntity and not quarantineReason and isQb and databaseInteger(storedVehicle.state) == 2 then
+            if deleteSpawnedVehicle(liveEntity) then
+                liveEntity = nil
+            else
+                quarantineReason = 'an impounded state-2 vehicle is still live and could not be deleted'
             end
         end
 
-        print(('[drs_garages] Restart reconciliation kept %s live vehicle(s) active and returned %s missing vehicle(s) to storage.'):format(recovered, returned))
-        return
+        if quarantineReason and normalizedPlate then
+            vehicleReconciliationQuarantine[normalizedPlate] = quarantineReason
+            quarantined = quarantined + 1
+            print(('[drs_garages] WARNING: Quarantined plate %s during restart reconciliation: %s. Remove the conflicting entity and restart drs_garages.'):format(
+                normalizedPlate,
+                tostring(quarantineReason)
+            ))
+        elseif liveEntity then
+
+            if not applyVehicleIdentityState(liveEntity, storedVehicle) then
+                error(('failed to apply managed identity state to recovered plate %s'):format(normalizedPlate))
+            end
+
+            activeVehicles[normalizedPlate] = liveEntity
+
+            local storedState = databaseInteger(storedVehicle.stored)
+            local qbState = isQb and databaseInteger(storedVehicle.state) or 0
+            if storedState ~= 0 or qbState ~= 0 then
+                local affected = tonumber(setVehicleStored(normalizedPlate, 0))
+                if affected ~= 1 then
+                    error(('failed to synchronize live vehicle storage state for plate %s (affected=%s)'):format(
+                        normalizedPlate,
+                        tostring(affected)
+                    ))
+                end
+            end
+
+            recovered = recovered + 1
+        elseif isQb and databaseInteger(storedVehicle.state) == 2 and normalizedPlate then
+            -- State 2 is the stock QB/Qbox impound state. Never let automatic
+            -- restart recovery turn an impounded vehicle into a free garage car.
+            if databaseInteger(storedVehicle.stored) ~= 0 then
+                local updateOk, affected = pcall(MySQL.update.await, [[
+                    UPDATE `player_vehicles`
+                    SET `stored` = 0
+                    WHERE `plate` = ? AND `state` = 2
+                    LIMIT 1
+                ]], { normalizedPlate })
+
+                if not updateOk or tonumber(affected) ~= 1 then
+                    error(('failed to synchronize impounded vehicle %s (affected=%s)'):format(
+                        normalizedPlate,
+                        tostring(affected)
+                    ))
+                end
+            end
+
+            preservedImpounds = preservedImpounds + 1
+        elseif returnMissing and normalizedPlate then
+            local affected = tonumber(setVehicleStored(normalizedPlate, 1))
+            if affected ~= 1 then
+                error(('failed to return missing vehicle %s to storage (affected=%s)'):format(
+                    normalizedPlate,
+                    tostring(affected)
+                ))
+            end
+
+            returned = returned + 1
+        end
     end
 
-    if returnMissing then
-        MySQL.update.await(Queries.setStoredVehicle:gsub('WHERE plate = ?', 'WHERE `stored` = 0'), { 1 })
-    end
+    print(('[drs_garages] Restart reconciliation kept %s live vehicle(s) active, returned %s missing vehicle(s) to storage, preserved %s impound row(s), and quarantined %s suspicious plate(s).'):format(
+        recovered,
+        returned,
+        preservedImpounds,
+        quarantined
+    ))
+
+    return recovered, returned, preservedImpounds, quarantined
 end
 
 AddEventHandler('onResourceStart', function(resource)
     if resource ~= cache.resource then return end
     Wait(100)
 
-    if DRSGaragesDatabase and DRSGaragesDatabase.awaitReady then
-        local waitOk, databaseReady, databaseError = pcall(DRSGaragesDatabase.awaitReady)
+    local databaseApi = rawget(_G, 'DRSGaragesDatabase')
 
-        if not waitOk or not databaseReady then
-            print(('[drs_garages] Restart reconciliation skipped because database setup did not complete: %s'):format(
-                tostring(waitOk and databaseError or databaseReady)
-            ))
-            return
-        end
+    if type(databaseApi) ~= 'table' or type(databaseApi.awaitReady) ~= 'function' then
+        startupReconciliationComplete = true
+        startupReconciliationSuccessful = false
+        startupReconciliationDetail = 'database readiness API is unavailable; startup reconciliation did not run'
+        print(('[drs_garages] ERROR: %s.'):format(startupReconciliationDetail))
+        return
     end
 
-    if Framework.name == 'qb-core' or Framework.name == 'qbx_core' or Config.AutoRespawn then
-        activeVehicles = {} -- rebuild the cache from authoritative world/DB state
-        moveOutVehiclesIntoGarages(Config.AutoRespawn == true)
+    local waitOk, databaseReady, databaseDetail = pcall(databaseApi.awaitReady)
+
+    if not waitOk or not databaseReady then
+        startupReconciliationComplete = true
+        startupReconciliationSuccessful = false
+        startupReconciliationDetail = ('database setup did not complete: %s'):format(
+            tostring(waitOk and databaseDetail or databaseReady)
+        )
+        print(('[drs_garages] ERROR: Restart reconciliation failed because %s.'):format(startupReconciliationDetail))
+        return
+    end
+
+    activeVehicles = {} -- rebuild the cache from authoritative world/DB state
+    vehicleReconciliationQuarantine = {}
+
+    local reconciliationOk, recoveredOrError, returned, preservedImpounds, quarantined = xpcall(function()
+        return moveOutVehiclesIntoGarages(Config.AutoRespawn == true)
+    end, function(errorMessage)
+        return debug.traceback(errorMessage, 2)
+    end)
+
+    startupReconciliationComplete = true
+    startupReconciliationSuccessful = reconciliationOk == true
+
+    if reconciliationOk then
+        startupReconciliationDetail = ('reconciled %d live, %d missing, %d preserved impound, and %d quarantined vehicle(s)'):format(
+            tonumber(recoveredOrError) or 0,
+            tonumber(returned) or 0,
+            tonumber(preservedImpounds) or 0,
+            tonumber(quarantined) or 0
+        )
+    else
+        startupReconciliationDetail = ('startup reconciliation raised an error: %s'):format(tostring(recoveredOrError))
+        print(('[drs_garages] ERROR: %s'):format(startupReconciliationDetail))
     end
 end)
 
+local function revalidateVehicleListPlayer(source, identifier, job, society)
+    local player = Framework.getPlayerFromId(source)
+    if not player or player:getIdentifier() ~= identifier then return end
+
+    if society and (not isValidSocietyJobName(job) or player:getJob() ~= job) then return end
+
+    return player
+end
 
 
 lib.callback.register('drs_garages:getOwnedVehicles', function(source, index, society)
     if not databaseIsUsable(source) then return {} end
 
+    society = society == true
+
     local player = Framework.getPlayerFromId(source)
     if not player then return end
+    if society and not isValidSocietyJobName(player:getJob()) then return {} end
+
+    local identifier = player:getIdentifier()
+    local job = society and player:getJob() or nil
     
     local garage = getGarage(index)
     if not garage then
@@ -835,23 +1957,32 @@ lib.callback.register('drs_garages:getOwnedVehicles', function(source, index, so
 
     if society then
         local vehicles = MySQL.query.await(Queries.getGarageSociety, {
-            player:getJob()
-        })
+            job
+        }) or {}
+
+        player = revalidateVehicleListPlayer(source, identifier, job, true)
+        if not player then return {} end
+
+        vehicles = FilterDrsGarageVehicles(source, index, vehicles, true)
 
         for _, vehicle in ipairs(vehicles) do
-            if isVehicleStorageInProgress(vehicle.plate) then
+            local plate = normalizePlate(vehicle.plate)
+
+            if not vehicleMatchesOwnershipMode(vehicle, player, true) then
+                vehicle.state = nil
+            elseif not plate then
+                vehicle.state = 'in_impound'
+            elseif isVehicleStorageInProgress(plate) then
                 vehicle.state = 'out_garage'
-            elseif vehicle.stored == 1 or vehicle.stored == true then
+            elseif rowHasStorageState(vehicle, 1) then
                 vehicle.state = 'in_garage'
-            elseif activeVehicles[vehicle.plate] then
-                local entity = activeVehicles[vehicle.plate]
+            elseif getActiveVehicleByPlate(plate) then
+                local entity = activeVehicles[plate]
                 if not DoesEntityExist(entity) then
-                    activeVehicles[vehicle.plate] = nil
+                    activeVehicles[plate] = nil
                     vehicle.state = 'in_impound'
                 elseif GetVehiclePetrolTankHealth(entity) <= 0 or GetVehicleBodyHealth(entity) <= 0 then
-                    DeleteEntity(entity)
-                    activeVehicles[vehicle.plate] = nil
-                    vehicle.state = 'in_impound'
+                    vehicle.state = deleteDestroyedActiveVehicle(plate, entity) and 'in_impound' or 'out_garage'
                 else
                     vehicle.state = 'out_garage'
                 end
@@ -860,26 +1991,42 @@ lib.callback.register('drs_garages:getOwnedVehicles', function(source, index, so
             end
         end
 
-        return vehicles
+        if not revalidateVehicleListPlayer(source, identifier, job, true) then return {} end
+
+        local authorizedVehicles = {}
+        for _, vehicle in ipairs(vehicles) do
+            if vehicleMatchesOwnershipMode(vehicle, player, true) then authorizedVehicles[#authorizedVehicles + 1] = vehicle end
+        end
+
+        return BuildDrsGarageClientVehicles(authorizedVehicles)
     else
         local vehicles = MySQL.query.await(Queries.getGarage, {
-            player:getIdentifier()
-        })
+            identifier
+        }) or {}
+
+        player = revalidateVehicleListPlayer(source, identifier, nil, false)
+        if not player then return {} end
+
+        vehicles = FilterDrsGarageVehicles(source, index, vehicles, false)
 
         for _, vehicle in ipairs(vehicles) do
-            if isVehicleStorageInProgress(vehicle.plate) then
+            local plate = normalizePlate(vehicle.plate)
+
+            if not vehicleMatchesOwnershipMode(vehicle, player, false) then
+                vehicle.state = nil
+            elseif not plate then
+                vehicle.state = 'in_impound'
+            elseif isVehicleStorageInProgress(plate) then
                 vehicle.state = 'out_garage'
-            elseif vehicle.stored == 1 or vehicle.stored == true then
+            elseif rowHasStorageState(vehicle, 1) then
                 vehicle.state = 'in_garage'
-            elseif activeVehicles[vehicle.plate] then
-                local entity = activeVehicles[vehicle.plate]
+            elseif getActiveVehicleByPlate(plate) then
+                local entity = activeVehicles[plate]
                 if not DoesEntityExist(entity) then
-                    activeVehicles[vehicle.plate] = nil
+                    activeVehicles[plate] = nil
                     vehicle.state = 'in_impound'
-                elseif not DoesEntityExist(entity) or GetVehiclePetrolTankHealth(entity) <= 0 or GetVehicleBodyHealth(entity) <= 0 then
-                    DeleteEntity(entity)
-                    activeVehicles[vehicle.plate] = nil
-                    vehicle.state = 'in_impound'
+                elseif GetVehiclePetrolTankHealth(entity) <= 0 or GetVehicleBodyHealth(entity) <= 0 then
+                    vehicle.state = deleteDestroyedActiveVehicle(plate, entity) and 'in_impound' or 'out_garage'
                 else
                     vehicle.state = 'out_garage'
                 end
@@ -888,7 +2035,14 @@ lib.callback.register('drs_garages:getOwnedVehicles', function(source, index, so
             end
         end
 
-        return vehicles
+        if not revalidateVehicleListPlayer(source, identifier, nil, false) then return {} end
+
+        local authorizedVehicles = {}
+        for _, vehicle in ipairs(vehicles) do
+            if vehicleMatchesOwnershipMode(vehicle, player, false) then authorizedVehicles[#authorizedVehicles + 1] = vehicle end
+        end
+
+        return BuildDrsGarageClientVehicles(authorizedVehicles)
     end
 end)
 
@@ -896,8 +2050,14 @@ end)
 lib.callback.register('drs_garages:getImpoundedVehicles', function(source, index, society)
     if not databaseIsUsable(source) then return {} end
 
+    society = society == true
+
     local player = Framework.getPlayerFromId(source)
     if not player then return end
+    if society and not isValidSocietyJobName(player:getJob()) then return {} end
+
+    local identifier = player:getIdentifier()
+    local job = society and player:getJob() or nil
     
     local impound = Config.Impounds[index]
     if not impound then
@@ -911,65 +2071,82 @@ lib.callback.register('drs_garages:getImpoundedVehicles', function(source, index
 
     if society then
         local vehicles = MySQL.query.await(Queries.getImpoundSociety, {
-            player:getJob()
-        })
+            job
+        }) or {}
+
+        player = revalidateVehicleListPlayer(source, identifier, job, true)
+        if not player then return {} end
 
         local filtered = {}
 
         for _, vehicle in ipairs(vehicles) do
-            local entity = activeVehicles[vehicle.plate]
+            local plate = normalizePlate(vehicle.plate)
+            local entity = plate and getActiveVehicleByPlate(plate) or nil
 
-            if isVehicleStorageInProgress(vehicle.plate) then
+            if not vehicleMatchesOwnershipMode(vehicle, player, true) or not plate
+                or not rowTypeMatchesGarage(vehicle, impound) or not rowHasStorageState(vehicle, 0)
+            then
+                -- Invalid/mismatched rows never cross vehicle-type impounds.
+            elseif isVehicleStorageInProgress(plate) then
                 -- A verified store operation owns this plate until it commits.
             elseif not entity then
                 table.insert(filtered, vehicle)
             elseif not DoesEntityExist(entity) then
-                activeVehicles[vehicle.plate] = nil
+                activeVehicles[plate] = nil
                 table.insert(filtered, vehicle)
             elseif GetVehiclePetrolTankHealth(entity) <= 0 or GetVehicleBodyHealth(entity) <= 0 then
-                DeleteEntity(entity)
-                activeVehicles[vehicle.plate] = nil
-                table.insert(filtered, vehicle)
+                if deleteDestroyedActiveVehicle(plate, entity) then table.insert(filtered, vehicle) end
             end
         end
 
-        return filtered
+        if not revalidateVehicleListPlayer(source, identifier, job, true) then return {} end
+        return BuildDrsGarageClientVehicles(filtered)
     else
         local vehicles = MySQL.query.await(Queries.getImpound, {
-            player:getIdentifier()
-        })
+            identifier
+        }) or {}
+
+        player = revalidateVehicleListPlayer(source, identifier, nil, false)
+        if not player then return {} end
 
         local filtered = {}
 
         for _, vehicle in ipairs(vehicles) do
-            local entity = activeVehicles[vehicle.plate]
+            local plate = normalizePlate(vehicle.plate)
+            local entity = plate and getActiveVehicleByPlate(plate) or nil
 
-            if isVehicleStorageInProgress(vehicle.plate) then
+            if not vehicleMatchesOwnershipMode(vehicle, player, false) or not plate
+                or not rowTypeMatchesGarage(vehicle, impound) or not rowHasStorageState(vehicle, 0)
+            then
+                -- Invalid/mismatched rows never cross vehicle-type impounds.
+            elseif isVehicleStorageInProgress(plate) then
                 -- A verified store operation owns this plate until it commits.
             elseif not entity then
                 table.insert(filtered, vehicle)
             elseif not DoesEntityExist(entity) then
-                activeVehicles[vehicle.plate] = nil
+                activeVehicles[plate] = nil
                 table.insert(filtered, vehicle)
             elseif GetVehiclePetrolTankHealth(entity) <= 0 or GetVehicleBodyHealth(entity) <= 0 then
-                DeleteEntity(entity)
-                activeVehicles[vehicle.plate] = nil
-                table.insert(filtered, vehicle)
+                if deleteDestroyedActiveVehicle(plate, entity) then table.insert(filtered, vehicle) end
             end
         end
 
-        return filtered
+        if not revalidateVehicleListPlayer(source, identifier, nil, false) then return {} end
+        return BuildDrsGarageClientVehicles(filtered)
     end
 end)
 
 lib.callback.register('drs_garages:takeOutVehicle', function(source, index, plate, type, society)
     if not databaseIsUsable(source) then return end
 
+    society = society == true
+
     plate = normalizePlate(plate)
     if not plate or isVehicleStorageInProgress(plate) or getActiveVehicleByPlate(plate) then return end
 
     local player = Framework.getPlayerFromId(source)
     if not player then return end
+    if society and not isValidSocietyJobName(player:getJob()) then return end
 
     local garage = getGarage(index)
     if not garage then
@@ -985,36 +2162,148 @@ lib.callback.register('drs_garages:takeOutVehicle', function(source, index, plat
         return
     end
 
-    local vehicle = MySQL.single.await(Queries.getStoredVehicle, {
-        player:getIdentifier(), player:getJob(), plate, 1
-    })
+    local token = beginRetrievalOperation(plate, source)
+    if not token then return end
 
-    if isVehicleStorageInProgress(plate) or getActiveVehicleByPlate(plate) then return end
+    local operationEntity
+    local function performTakeout()
+    local function finish(...)
+        return ...
+    end
 
-    if vehicle then
-        if not vehicleMatchesOwnershipMode(vehicle, player, society) then
-            return
+    local identifier = player:getIdentifier()
+    local job = player:getJob()
+    local ownershipMode = society and 'society' or 'personal'
+
+    local function revalidateContext()
+        local currentPlayer = Framework.getPlayerFromId(source)
+        local operation = getRetrievalOperation(plate)
+
+        if not operation or operation.token ~= token or not currentPlayer then return end
+        if getGarage(index) ~= garage then return end
+        if currentPlayer:getIdentifier() ~= identifier then return end
+        if society and currentPlayer:getJob() ~= job then return end
+        if garage.Property and society then return end
+        if not playerCanAccessGarage(currentPlayer, garage) or not isNearGarage(source, garage) then return end
+        if not spawnTypeMatchesGarage(type, garage) then return end
+
+        return currentPlayer
+    end
+
+    local vehicle = queryStrictVehicle(player, plate, society == true, true)
+    player = revalidateContext()
+
+    if not player or not vehicle or normalizePlate(vehicle.plate) ~= plate then return finish() end
+    if not rowHasStorageState(vehicle, 1) or not vehicleMatchesOwnershipMode(vehicle, player, society) then return finish() end
+    if not vehicleVisibleAtGarage(vehicle, index, garage, player, society == true) then return finish() end
+
+    -- Claim the exact stored row before creating an entity. A resource/process
+    -- crash can then only leave an out/impound-recoverable row, never a stored
+    -- row plus a live duplicate.
+    local transitioned = transitionVehicleStorageState(vehicle, ownershipMode, identifier, job, 1, 0)
+    if not transitioned then return finish() end
+
+    local entity, owner, props, cleanupSafe = spawnStoredVehicle(vehicle, garage, plate, type)
+    operationEntity = entity
+    if not entity then
+        if cleanupSafe then transitionVehicleStorageState(vehicle, ownershipMode, identifier, job, 0, 1) end
+        return finish()
+    end
+
+    player = revalidateContext()
+    local currentVehicle = player and queryStrictVehicle(player, plate, society == true, false) or nil
+    player = revalidateContext()
+    local sameId = vehicle.id == nil or currentVehicle and tostring(currentVehicle.id) == tostring(vehicle.id)
+    local currentModelMatches, currentHasStoredModel = false, false
+
+    if currentVehicle then
+        currentModelMatches, currentHasStoredModel = vehicleMatchesStoredModel(entity, currentVehicle)
+    end
+
+    if not player or not currentVehicle or not sameId or not DoesEntityExist(entity)
+        or normalizePlate(currentVehicle.plate) ~= plate
+        or not rowHasStorageState(currentVehicle, 0)
+        or not vehicleMatchesOwnershipMode(currentVehicle, player, society)
+        or not vehicleVisibleAtGarage(currentVehicle, index, garage, player, society == true)
+        or not currentHasStoredModel or not currentModelMatches
+        or getActiveVehicleByPlate(plate)
+    then
+        local existing = getActiveVehicleByPlate(plate)
+        local deleted = deleteSpawnedVehicle(entity)
+
+        if deleted and not existing then
+            transitionVehicleStorageState(vehicle, ownershipMode, identifier, job, 0, 1)
+        elseif not deleted and DoesEntityExist(entity) then
+            activeVehicles[plate] = entity
         end
 
-        local coords = garage.SpawnPosition
-        local props = json.decode(vehicle.mods or vehicle.vehicle)
-        local entity = Utils.createVehicle(props.model, coords, type)
-
-        if entity == 0 then return end
-
-        setVehicleStored(plate, 0)
-
-        while NetworkGetEntityOwner(entity) == -1 do Wait(0) end
-
-        local netId, owner = NetworkGetNetworkIdFromEntity(entity), NetworkGetEntityOwner(entity)
-        
-        TriggerClientEvent('drs_garages:setVehicleProperties', owner, netId, props)
-
-        activeVehicles[plate] = entity
-        giveVehicleKeys(source, entity)
-
-        return netId
+        return finish()
     end
+
+    if not DoesEntityExist(entity) then
+        transitionVehicleStorageState(vehicle, ownershipMode, identifier, job, 0, 1)
+        return finish()
+    end
+
+    local netId = NetworkGetNetworkIdFromEntity(entity)
+    if not netId or netId < 1 then
+        local deleted = deleteSpawnedVehicle(entity)
+        if deleted then
+            transitionVehicleStorageState(vehicle, ownershipMode, identifier, job, 0, 1)
+        elseif DoesEntityExist(entity) then
+            activeVehicles[plate] = entity
+        end
+        return finish()
+    end
+
+    if not applyVehicleIdentityState(entity, currentVehicle) then
+        local deleted = deleteSpawnedVehicle(entity)
+
+        if deleted then
+            transitionVehicleStorageState(vehicle, ownershipMode, identifier, job, 0, 1)
+        elseif DoesEntityExist(entity) then
+            activeVehicles[plate] = entity
+        end
+
+        return finish()
+    end
+
+    activeVehicles[plate] = entity
+    TriggerClientEvent('drs_garages:setVehicleProperties', owner, netId, props)
+    pcall(giveVehicleKeys, source, entity)
+
+    return finish(netId)
+    end
+
+    local results = table.pack(xpcall(performTakeout, function(errorMessage)
+        return debug.traceback(errorMessage, 2)
+    end))
+
+    if not results[1] then
+        local cleanupOk, cleanupError = xpcall(function()
+            if operationEntity and DoesEntityExist(operationEntity) then
+                if not deleteSpawnedVehicle(operationEntity) then
+                    activeVehicles[plate] = operationEntity
+                    vehicleReconciliationQuarantine[plate] = 'unexpected takeout failure left a live entity'
+                end
+            end
+        end, function(errorMessage)
+            return debug.traceback(errorMessage, 2)
+        end)
+        if not cleanupOk then
+            if operationEntity then
+                activeVehicles[plate] = operationEntity
+                vehicleReconciliationQuarantine[plate] = 'unexpected takeout cleanup failure may have left a live entity'
+            end
+            print(('[drs_garages] Unexpected takeout cleanup error for plate %s: %s'):format(plate, tostring(cleanupError)))
+        end
+        endRetrievalOperation(plate, token)
+        print(('[drs_garages] Unexpected takeout error for plate %s: %s'):format(plate, tostring(results[2])))
+        return
+    end
+
+    endRetrievalOperation(plate, token)
+    return table.unpack(results, 2, results.n)
 end)
 
 lib.callback.register('drs_garages:saveVehicle', function(source, props, netId, index, spawnType)
@@ -1022,7 +2311,6 @@ lib.callback.register('drs_garages:saveVehicle', function(source, props, netId, 
 
     local player = Framework.getPlayerFromId(source)
     if not player then return end
-
     local garage = getGarage(index)
     if not garage then
         invalidIndexMessage('garage', source, index)
@@ -1038,7 +2326,7 @@ lib.callback.register('drs_garages:saveVehicle', function(source, props, netId, 
     local plate = normalizePlate(props.plate)
     local model = normalizeModelHash(props.model)
 
-    if not plate or not model then return false end
+    if not plate or not model or isVehicleStorageInProgress(plate) then return false end
 
     local entity = validateVehicleForStorage(source, garage, netId, plate, model)
     if not entity then return false end
@@ -1046,6 +2334,12 @@ lib.callback.register('drs_garages:saveVehicle', function(source, props, netId, 
     -- Only the server-registered entity for this plate may change persistent
     -- storage state. A client-created clone with a copied plate/model is rejected.
     if not isExactActiveVehicle(plate, entity) then return false end
+
+    -- Reserve before the first database yield so ownership contracts and other
+    -- storage flows cannot transfer or replace this plate mid-save.
+    vehicleStorageOperations[plate] = entity
+
+    local function performSave()
 
     local identifier = player:getIdentifier()
     local initialJob = player:getJob()
@@ -1056,6 +2350,7 @@ lib.callback.register('drs_garages:saveVehicle', function(source, props, netId, 
         local currentPlayer = Framework.getPlayerFromId(source)
 
         if not currentPlayer or currentPlayer:getIdentifier() ~= identifier then return end
+        if getGarage(index) ~= garage then return end
         if ownershipMode == 'society' and (garage.Property or currentPlayer:getJob() ~= ownershipJob) then return end
         if not playerCanAccessGarage(currentPlayer, garage) or not isNearGarageParking(source, garage) then return end
         if not spawnTypeMatchesGarage(spawnType, garage) then return end
@@ -1082,7 +2377,7 @@ lib.callback.register('drs_garages:saveVehicle', function(source, props, netId, 
     if not player then return false end
 
     if not storedVehicle then
-        if garage.Property or type(initialJob) ~= 'string' or initialJob == '' or player:getJob() ~= initialJob then
+        if garage.Property or not isValidSocietyJobName(initialJob) or player:getJob() ~= initialJob then
             return false
         end
 
@@ -1105,10 +2400,12 @@ lib.callback.register('drs_garages:saveVehicle', function(source, props, netId, 
     end
 
     local modelMatches, hasStoredModel = vehicleMatchesStoredModel(entity, storedVehicle)
-    if not hasStoredModel or not modelMatches then return false end
+    if not hasStoredModel or not modelMatches or not rowTypeMatchesGarage(storedVehicle, garage) then return false end
 
-    props.plate = plate
-    local encodedOk, encodedProps = pcall(json.encode, props)
+    local trustedProps = buildTrustedParkingProperties(storedVehicle, entity, plate)
+    if not trustedProps then return false end
+
+    local encodedOk, encodedProps = pcall(json.encode, trustedProps)
     if not encodedOk or type(encodedProps) ~= 'string' then return false end
 
     local maxPropsBytes = tonumber(Config.MaxVehiclePropsBytes)
@@ -1121,6 +2418,8 @@ lib.callback.register('drs_garages:saveVehicle', function(source, props, netId, 
 
     local garageName = garageStorageName(index, garage)
     local isQb = Framework.name == 'qb-core' or Framework.name == 'qbx_core'
+    if isQb and not garageName then return false end
+
     local tableName = isQb and 'player_vehicles' or 'owned_vehicles'
     local ownershipWhere
     local ownershipParams = {}
@@ -1143,28 +2442,24 @@ lib.callback.register('drs_garages:saveVehicle', function(source, props, netId, 
         ownershipParams[#ownershipParams + 1] = plate
     end
 
+    ownershipWhere = ownershipWhere .. ' AND `stored` = 0'
+    if isQb then ownershipWhere = ownershipWhere .. ' AND `state` = 0' end
+
     local function scopedUpdate(setClause, setParams)
         for i = 1, #ownershipParams do
             setParams[#setParams + 1] = ownershipParams[i]
         end
 
-        return ('UPDATE `%s` SET %s WHERE %s'):format(tableName, setClause, ownershipWhere), setParams
+        return ('UPDATE `%s` SET %s WHERE %s LIMIT 1'):format(tableName, setClause, ownershipWhere), setParams
     end
 
     local updateQuery, updateParams
 
     if isQb then
-        if garageName then
-            updateQuery, updateParams = scopedUpdate(
-                '`stored` = 1, `state` = 1, `garage` = ?, `mods` = ?',
-                { garageName, encodedProps }
-            )
-        else
-            updateQuery, updateParams = scopedUpdate(
-                '`stored` = 1, `state` = 1, `mods` = ?',
-                { encodedProps }
-            )
-        end
+        updateQuery, updateParams = scopedUpdate(
+            '`stored` = 1, `state` = 1, `garage` = ?, `mods` = ?',
+            { garageName, encodedProps }
+        )
     else
         updateQuery, updateParams = scopedUpdate(
             '`stored` = 1, `vehicle` = ?',
@@ -1174,13 +2469,12 @@ lib.callback.register('drs_garages:saveVehicle', function(source, props, netId, 
 
     -- The row must still describe an out vehicle. Deleting first means a failed
     -- deletion cannot alter its state or client-supplied properties at all.
-    if databaseInteger(storedVehicle.stored) ~= 0 then return false end
+    if not rowHasStorageState(storedVehicle, 0) then return false end
     if isQb and databaseInteger(storedVehicle.state) ~= 0 then return false end
 
-    if vehicleStorageOperations[plate] or not isExactActiveVehicle(plate, entity) then return false end
-    vehicleStorageOperations[plate] = entity
+    if vehicleStorageOperations[plate] ~= entity or not isExactActiveVehicle(plate, entity) then return false end
 
-    local deleted = deleteRegisteredVehicle(plate, entity, netId)
+    local deleted = deleteRegisteredVehicle(source, plate, entity, netId)
 
     if not deleted then
         -- Internal listing/unregister paths honor the operation lock. Repair the
@@ -1193,7 +2487,6 @@ lib.callback.register('drs_garages:saveVehicle', function(source, props, netId, 
             activeVehicles[plate] = entity
         end
 
-        vehicleStorageOperations[plate] = nil
         return false
     end
 
@@ -1202,7 +2495,6 @@ lib.callback.register('drs_garages:saveVehicle', function(source, props, netId, 
     player = revalidateOwnershipContext()
     if not player or vehicleStorageOperations[plate] ~= entity or activeVehicles[plate] ~= entity then
         if activeVehicles[plate] == entity then activeVehicles[plate] = nil end
-        vehicleStorageOperations[plate] = nil
         return false
     end
 
@@ -1214,22 +2506,42 @@ lib.callback.register('drs_garages:saveVehicle', function(source, props, netId, 
     revalidateOwnershipContext()
 
     local changedCount = tonumber(changed)
-    local stored = updateOk and changedCount and changedCount >= 1
+    local stored = updateOk and changedCount == 1
 
     if activeVehicles[plate] == entity then activeVehicles[plate] = nil end
-    vehicleStorageOperations[plate] = nil
 
     return stored == true
+    end
+
+    local operationOk, result = xpcall(performSave, function(errorMessage)
+        return debug.traceback(errorMessage, 2)
+    end)
+
+    if activeVehicles[plate] == entity and not DoesEntityExist(entity) then
+        activeVehicles[plate] = nil
+    end
+
+    if vehicleStorageOperations[plate] == entity then vehicleStorageOperations[plate] = nil end
+
+    if not operationOk then
+        print(('[drs_garages] Unexpected parking error for plate %s: %s'):format(plate, tostring(result)))
+        return false
+    end
+
+    return result == true
 end)
 
 lib.callback.register('drs_garages:retrieveVehicle', function(source, index, plate, type, society)
     if not databaseIsUsable(source) then return false end
+
+    society = society == true
 
     plate = normalizePlate(plate)
     if not plate or isVehicleStorageInProgress(plate) or getActiveVehicleByPlate(plate) then return end
 
     local player = Framework.getPlayerFromId(source)
     if not player then return end
+    if society and not isValidSocietyJobName(player:getJob()) then return false end
 
     local impound = Config.Impounds[index]
     if not impound then
@@ -1241,48 +2553,311 @@ lib.callback.register('drs_garages:retrieveVehicle', function(source, index, pla
         return false
     end
 
-    local vehicle = MySQL.single.await(Queries.getOwnedVehicle, {
-        player:getIdentifier(), player:getJob(), plate
-    })
+    local token = beginRetrievalOperation(plate, source)
+    if not token then return false end
 
-    if isVehicleStorageInProgress(plate) or getActiveVehicleByPlate(plate) then return false end
-
-    if vehicle then
-        if not vehicleMatchesOwnershipMode(vehicle, player, society) then
-            return false
-        end
-
-        if player:getAccountMoney('money') < Config.ImpoundPrice then return false end
-
-        player:removeAccountMoney('money', Config.ImpoundPrice)
-
-        local coords = impound.SpawnPosition
-        local props = json.decode(vehicle.mods or vehicle.vehicle)
-        local entity = Utils.createVehicle(props.model, coords, type)
-
-        if entity == 0 then return end
-
-        setVehicleStored(plate, 0)
-
-        while NetworkGetEntityOwner(entity) == -1 do Wait(0) end
-
-        local netId, owner = NetworkGetNetworkIdFromEntity(entity), NetworkGetEntityOwner(entity)
-        
-        TriggerClientEvent('drs_garages:setVehicleProperties', owner, netId, props)
-
-        activeVehicles[props.plate] = entity
-        giveVehicleKeys(source, entity)
-
-        return true, netId
+    local operationEntity
+    local function performImpoundRetrieval()
+    local function finish(...)
+        return ...
     end
 
-    return false
+    local function rejectSpawn(entity)
+        if not deleteSpawnedVehicle(entity) and DoesEntityExist(entity) then
+            -- The persisted row is already out/impounded. Track an entity that
+            -- could not be removed so another retrieval cannot create a clone.
+            activeVehicles[plate] = entity
+        end
+
+        return finish(false)
+    end
+
+    local identifier = player:getIdentifier()
+    local job = player:getJob()
+
+    local function revalidateContext()
+        local currentPlayer = Framework.getPlayerFromId(source)
+        local operation = getRetrievalOperation(plate)
+
+        if not operation or operation.token ~= token or not currentPlayer then return end
+        if currentPlayer:getIdentifier() ~= identifier then return end
+        if society and currentPlayer:getJob() ~= job then return end
+        if not playerCanAccessGarage(currentPlayer, impound) or not isNearGarage(source, impound) then return end
+        if not spawnTypeMatchesGarage(type, impound) then return end
+
+        return currentPlayer
+    end
+
+    local vehicle = queryStrictVehicle(player, plate, society == true, false)
+    player = revalidateContext()
+
+    if not player or not vehicle or normalizePlate(vehicle.plate) ~= plate then return finish(false) end
+    if not rowHasStorageState(vehicle, 0) or not rowTypeMatchesGarage(vehicle, impound) then return finish(false) end
+    if not vehicleMatchesOwnershipMode(vehicle, player, society) then return finish(false) end
+
+    local price = math.max(0, math.floor(tonumber(Config.ImpoundPrice) or 0))
+    local balanceOk, balance = pcall(player.getAccountMoney, player, 'money')
+    if not balanceOk or tonumber(balance) == nil or tonumber(balance) < price then return finish(false) end
+
+    local entity, owner, props = spawnStoredVehicle(vehicle, impound, plate, type)
+    operationEntity = entity
+    if not entity then return finish(false) end
+
+    player = revalidateContext()
+    if not player or getActiveVehicleByPlate(plate) then
+        return rejectSpawn(entity)
+    end
+
+    -- Re-read after the bounded OneSync ownership wait. The row must still be
+    -- the same authorized out vehicle before any money can be removed.
+    local currentVehicle = queryStrictVehicle(player, plate, society == true, false)
+    player = revalidateContext()
+
+    local sameId = vehicle.id == nil or currentVehicle and tostring(currentVehicle.id) == tostring(vehicle.id)
+    if not player or not currentVehicle or not sameId or not rowHasStorageState(currentVehicle, 0)
+        or not rowTypeMatchesGarage(currentVehicle, impound)
+        or not vehicleMatchesOwnershipMode(currentVehicle, player, society)
+    then
+        return rejectSpawn(entity)
+    end
+
+    local netId = NetworkGetNetworkIdFromEntity(entity)
+    if not DoesEntityExist(entity) or not netId or netId < 1 then
+        return rejectSpawn(entity)
+    end
+
+    if not applyVehicleIdentityState(entity, currentVehicle) then
+        return rejectSpawn(entity)
+    end
+
+    if price > 0 then
+        local beforeOk, beforeValue = pcall(player.getAccountMoney, player, 'money')
+        local beforeBalance = beforeOk and tonumber(beforeValue) or nil
+        if not beforeBalance or beforeBalance < price then
+            return rejectSpawn(entity)
+        end
+
+        local paymentOk, paymentResult = pcall(player.removeAccountMoney, player, 'money', price)
+        local afterOk, afterValue = pcall(player.getAccountMoney, player, 'money')
+        local afterBalance = afterOk and tonumber(afterValue) or nil
+        local deducted = afterBalance and afterBalance == beforeBalance - price
+
+        if not paymentOk or paymentResult == false or not deducted then
+            local refundAmount
+            if afterBalance and afterBalance < beforeBalance then
+                refundAmount = beforeBalance - afterBalance
+            elseif not afterBalance and paymentOk and paymentResult ~= false then
+                refundAmount = price
+            end
+
+            local deleted = deleteSpawnedVehicle(entity)
+            if deleted and refundAmount and refundAmount > 0 then
+                refundImpoundCharge(player, refundAmount, source, plate)
+            elseif not deleted and DoesEntityExist(entity) then
+                activeVehicles[plate] = entity
+                print(('[drs_garages] CRITICAL: Impound payment failed for plate %s, but its spawned entity could not be deleted; no automatic refund was issued.'):format(plate))
+            end
+
+            return finish(false)
+        end
+    end
+
+    local chargedPlayer = player
+    player = revalidateContext()
+    if not player or not DoesEntityExist(entity) then
+        local deleted = not DoesEntityExist(entity) or deleteSpawnedVehicle(entity)
+        if deleted and price > 0 then refundImpoundCharge(chargedPlayer, price, source, plate) end
+        return finish(false)
+    end
+
+    local function rollbackStateTwoRedemption()
+        local where = '`plate` = ? AND `stored` = 0 AND `state` = 0'
+        local params = { plate }
+
+        if currentVehicle.id ~= nil then
+            where = '`id` = ? AND ' .. where
+            table.insert(params, 1, currentVehicle.id)
+        end
+
+        if society then
+            where = where .. ' AND `job` = ?'
+            params[#params + 1] = job
+        else
+            where = where .. ' AND `citizenid` = ? AND `job` IS NULL'
+            params[#params + 1] = identifier
+        end
+
+        local rollbackOk, rolledBack = pcall(MySQL.update.await,
+            ('UPDATE `player_vehicles` SET `state` = 2 WHERE %s LIMIT 1'):format(where),
+            params
+        )
+        return rollbackOk and tonumber(rolledBack) == 1
+    end
+
+    local redeemedFromStateTwo = false
+    if (Framework.name == 'qb-core' or Framework.name == 'qbx_core')
+        and databaseInteger(currentVehicle.state) == 2
+    then
+        local where = '`plate` = ? AND `stored` = 0 AND `state` = 2'
+        local params = { plate }
+
+        if currentVehicle.id ~= nil then
+            where = '`id` = ? AND ' .. where
+            table.insert(params, 1, currentVehicle.id)
+        end
+
+        if society then
+            where = where .. ' AND `job` = ?'
+            params[#params + 1] = job
+        else
+            where = where .. ' AND `citizenid` = ? AND `job` IS NULL'
+            params[#params + 1] = identifier
+        end
+
+        local updateOk, changed = pcall(MySQL.update.await,
+            ('UPDATE `player_vehicles` SET `state` = 0 WHERE %s LIMIT 1'):format(where),
+            params
+        )
+        local changedCount = tonumber(changed)
+
+        if not updateOk or changedCount ~= 1 then
+            local deleted = deleteSpawnedVehicle(entity)
+            if deleted and price > 0 then
+                refundImpoundCharge(chargedPlayer, price, source, plate)
+            elseif not deleted and DoesEntityExist(entity) then
+                activeVehicles[plate] = entity
+                print(('[drs_garages] CRITICAL: Impound state commit failed for plate %s and the live entity could not be deleted; no automatic refund was issued.'):format(plate))
+            end
+
+            return finish(false)
+        end
+
+        redeemedFromStateTwo = true
+
+        local verifyQuery
+        local verifyParams
+        if currentVehicle.id ~= nil then
+            verifyQuery = 'SELECT * FROM `player_vehicles` WHERE `id` = ? LIMIT 1'
+            verifyParams = { currentVehicle.id }
+        else
+            verifyQuery = 'SELECT * FROM `player_vehicles` WHERE `plate` = ? LIMIT 1'
+            verifyParams = { plate }
+        end
+
+        local verifyOk, redeemedVehicle = pcall(MySQL.single.await, verifyQuery, verifyParams)
+        local sameRedeemedId = currentVehicle.id == nil
+            or redeemedVehicle and tostring(redeemedVehicle.id) == tostring(currentVehicle.id)
+        local ownershipMatches = redeemedVehicle and (society
+            and redeemedVehicle.job == job
+            or not society and redeemedVehicle.citizenid == identifier and redeemedVehicle.job == nil)
+        local redeemed = verifyOk and redeemedVehicle and sameRedeemedId
+            and normalizePlate(redeemedVehicle.plate) == plate
+            and databaseInteger(redeemedVehicle.stored) == 0
+            and databaseInteger(redeemedVehicle.state) == 0
+            and ownershipMatches
+
+        if not redeemed then
+            local deleted = deleteSpawnedVehicle(entity)
+            local rolledBack = deleted and rollbackStateTwoRedemption() or false
+
+            if deleted and rolledBack then
+                if price > 0 then refundImpoundCharge(chargedPlayer, price, source, plate) end
+            elseif DoesEntityExist(entity) then
+                activeVehicles[plate] = entity
+                vehicleReconciliationQuarantine[plate] = verifyOk
+                    and 'impound post-commit ownership verification failed'
+                    or 'impound post-commit database verification was unavailable'
+            end
+
+            print(('[drs_garages] CRITICAL: Impound state committed for plate %s, but exact post-commit verification failed (query=%s, deleted=%s, rolledBack=%s); no vehicle or keys were delivered.'):format(
+                plate,
+                tostring(verifyOk),
+                tostring(deleted),
+                tostring(rolledBack)
+            ))
+            return finish(false)
+        end
+
+        currentVehicle = redeemedVehicle
+    end
+
+    activeVehicles[plate] = entity
+
+    if not DoesEntityExist(entity) then
+        if activeVehicles[plate] == entity then activeVehicles[plate] = nil end
+
+        local safeToRefund = true
+        if redeemedFromStateTwo then
+            safeToRefund = rollbackStateTwoRedemption()
+        end
+
+        if safeToRefund and price > 0 then
+            refundImpoundCharge(chargedPlayer, price, source, plate)
+        elseif not safeToRefund then
+            print(('[drs_garages] CRITICAL: Redeemed impound %s vanished and its state rollback failed; payment was left for staff reconciliation.'):format(plate))
+        end
+        return finish(false)
+    end
+
+    TriggerClientEvent('drs_garages:setVehicleProperties', owner, netId, props)
+    pcall(giveVehicleKeys, source, entity)
+
+    return finish(true, netId)
+    end
+
+    local results = table.pack(xpcall(performImpoundRetrieval, function(errorMessage)
+        return debug.traceback(errorMessage, 2)
+    end))
+
+    if not results[1] then
+        local cleanupOk, cleanupError = xpcall(function()
+            if operationEntity and DoesEntityExist(operationEntity) then
+                if not deleteSpawnedVehicle(operationEntity) then
+                    activeVehicles[plate] = operationEntity
+                    vehicleReconciliationQuarantine[plate] = 'unexpected impound retrieval failure left a live entity'
+                end
+            end
+        end, function(errorMessage)
+            return debug.traceback(errorMessage, 2)
+        end)
+        if not cleanupOk then
+            if operationEntity then
+                activeVehicles[plate] = operationEntity
+                vehicleReconciliationQuarantine[plate] = 'unexpected impound cleanup failure may have left a live entity'
+            end
+            print(('[drs_garages] Unexpected impound cleanup error for plate %s: %s'):format(plate, tostring(cleanupError)))
+        end
+        endRetrievalOperation(plate, token)
+        print(('[drs_garages] Unexpected impound retrieval error for plate %s: %s'):format(plate, tostring(results[2])))
+        return false
+    end
+
+    endRetrievalOperation(plate, token)
+    return table.unpack(results, 2, results.n)
 end)
 
-lib.callback.register('drs_garages:getVehicleCoords', function(source, plate)
-    local entity = activeVehicles[plate]
+lib.callback.register('drs_garages:getVehicleCoords', function(source, plate, society)
+    if not databaseIsUsable(source) then return end
 
-    if not entity then return end
+    plate = normalizePlate(plate)
+    if not plate or isVehicleStorageInProgress(plate) then return end
+
+    local player = Framework.getPlayerFromId(source)
+    if not player then return end
+
+    society = society == true
+    local vehicle = queryStrictVehicle(player, plate, society, false)
+
+    if not vehicle or normalizePlate(vehicle.plate) ~= plate or not rowHasStorageState(vehicle, 0) then return end
+    if not vehicleMatchesOwnershipMode(vehicle, player, society) then return end
+    if isVehicleStorageInProgress(plate) then return end
+
+    local entity = getActiveVehicleByPlate(plate)
+    if not entity or not DoesEntityExist(entity) then return end
+    if normalizePlate(GetVehicleNumberPlateText(entity)) ~= plate then return end
+
+    local modelMatches, hasStoredModel = vehicleMatchesStoredModel(entity, vehicle)
+    if not hasStoredModel or not modelMatches then return end
 
     return GetEntityCoords(entity)
 end)

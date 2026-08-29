@@ -37,13 +37,26 @@ local supportedTargetProviders <const> = {
     qtarget = true
 }
 local managedPedPoints = {}
+local managedGlobalVehicleTargets = {}
+local managedRadialOptions = {}
+local radialCallbacks = {}
 local targetWarningShown = false
+local radialWarningShown = false
 local targetZoneSequence = 0
+local globalVehicleTargetSequence = 0
+local RADIAL_SELECT_EVENT <const> = 'drs_garages:client:selectRadialOption'
 
 local function targetWarning(message)
     if targetWarningShown then return end
 
     targetWarningShown = true
+    print(('[drs_garages] WARNING: %s'):format(message))
+end
+
+local function radialWarning(message)
+    if radialWarningShown then return end
+
+    radialWarningShown = true
     print(('[drs_garages] WARNING: %s'):format(message))
 end
 
@@ -141,6 +154,157 @@ end)
 exports('IsTargetEnabled', function()
     return Utils.isTargetEnabled()
 end)
+
+local supportedRadialProviders <const> = {
+    qbx_radialmenu = true,
+    ['qb-radialmenu'] = true,
+    ox_lib = true
+}
+
+local function getRadialConfiguration()
+    local radialConfig = Config and Config.RadialMenu
+    local enabled = radialConfig ~= false
+    local explicitProvider
+
+    if type(radialConfig) == 'string' then
+        local normalized = normalizedTargetName(radialConfig)
+        enabled = normalized ~= 'off' and normalized ~= 'none' and normalized ~= 'false'
+        if enabled and normalized ~= 'auto' then explicitProvider = normalized end
+    elseif type(radialConfig) == 'table' then
+        enabled = radialConfig.Enabled ~= false
+        explicitProvider = radialConfig.Resource or radialConfig.Provider
+    end
+
+    explicitProvider = normalizedTargetName(explicitProvider)
+    if explicitProvider == 'auto' then explicitProvider = nil end
+
+    return enabled, explicitProvider
+end
+
+local function getRadialProvider(warnIfMissing)
+    local enabled, explicitProvider = getRadialConfiguration()
+    if not enabled then return end
+
+    if explicitProvider then
+        if not supportedRadialProviders[explicitProvider] then
+            if warnIfMissing then
+                radialWarning(('the configured radial provider %s is unsupported. Use qbx_radialmenu, qb-radialmenu, or ox_lib.'):format(explicitProvider))
+            end
+            return
+        end
+
+        if GetResourceState(explicitProvider) == 'started' then return explicitProvider end
+
+        if warnIfMissing then
+            radialWarning(('the configured radial provider %s is not started; nearby garage radial access is unavailable.'):format(explicitProvider))
+        end
+        return
+    end
+
+    if GetResourceState('qbx_radialmenu') == 'started' then return 'qbx_radialmenu' end
+    if GetResourceState('qb-radialmenu') == 'started' then return 'qb-radialmenu' end
+    if GetResourceState('ox_lib') == 'started' then return 'ox_lib' end
+
+    if warnIfMissing then
+        radialWarning('no supported radial provider is started; nearby garage radial access is unavailable.')
+    end
+end
+
+function Utils.isRadialEnabled()
+    return getRadialConfiguration()
+end
+
+function Utils.getRadialProvider(warnIfMissing)
+    return getRadialProvider(warnIfMissing)
+end
+
+RegisterNetEvent(RADIAL_SELECT_EVENT, function(payload)
+    local id = type(payload) == 'table' and payload.id or payload
+    if type(id) ~= 'string' and type(payload) == 'table' and type(payload.args) == 'table' then
+        id = payload.args.id
+    end
+
+    local callback = type(id) == 'string' and radialCallbacks[id] or nil
+    if callback then callback() end
+end)
+
+local function removeRadialOption(handle)
+    if type(handle) ~= 'table' or not handle.id then return end
+
+    if handle.provider == 'qbx_radialmenu' and GetResourceState('qbx_radialmenu') == 'started' then
+        exports.qbx_radialmenu:RemoveOption(handle.id)
+    elseif handle.provider == 'qb-radialmenu' and GetResourceState('qb-radialmenu') == 'started' then
+        exports['qb-radialmenu']:RemoveOption(handle.id)
+    elseif handle.provider == 'ox_lib' and GetResourceState('ox_lib') == 'started' then
+        lib.removeRadialItem(handle.id)
+    end
+end
+
+---Adds one dynamic option to the active framework radial menu.
+---@param id string
+---@param option table
+---@return table? handle
+function Utils.addRadialOption(id, option)
+    if type(id) ~= 'string' or id == '' or type(option) ~= 'table' or type(option.onSelect) ~= 'function' then return end
+
+    local provider = getRadialProvider(true)
+    if not provider then return end
+
+    radialCallbacks[id] = option.onSelect
+    local ok, result = pcall(function()
+        if provider == 'qbx_radialmenu' then
+            return exports.qbx_radialmenu:AddOption({
+                id = id,
+                label = option.label,
+                icon = option.icon,
+                onSelect = function()
+                    local callback = radialCallbacks[id]
+                    if callback then callback() end
+                end
+            }, id)
+        elseif provider == 'qb-radialmenu' then
+            return exports['qb-radialmenu']:AddOption({
+                id = id,
+                title = option.label,
+                icon = option.icon,
+                type = 'client',
+                event = RADIAL_SELECT_EVENT,
+                args = { id = id },
+                shouldClose = true
+            }, id)
+        end
+
+        lib.addRadialItem({
+            id = id,
+            label = option.label,
+            icon = option.icon,
+            onSelect = function()
+                local callback = radialCallbacks[id]
+                if callback then callback() end
+            end
+        })
+        return id
+    end)
+
+    if not ok or result == false then
+        radialCallbacks[id] = nil
+        radialWarning(('the %s radial adapter failed: %s'):format(provider, tostring(result)))
+        return
+    end
+
+    local handle = { id = id, provider = provider }
+    managedRadialOptions[handle] = true
+    return handle
+end
+
+function Utils.removeRadialOption(handle)
+    if not managedRadialOptions[handle] then return false end
+
+    pcall(removeRadialOption, handle)
+    managedRadialOptions[handle] = nil
+    radialCallbacks[handle.id] = nil
+    return true
+end
 
 local function targetIcon(icon)
     if type(icon) ~= 'string' or icon == '' then return icon end
@@ -243,6 +407,126 @@ local function removeTargetZone(provider, zoneId)
     end
 end
 
+local function buildOxGlobalVehicleOptions(namespace, options)
+    local result = {}
+    local names = {}
+
+    for index, option in ipairs(options or {}) do
+        local selectedOption = option
+        local optionName = ('%s_%s'):format(namespace, index)
+        names[#names + 1] = optionName
+        result[index] = {
+            name = optionName,
+            label = selectedOption.label,
+            icon = targetIcon(selectedOption.icon),
+            groups = selectedOption.job,
+            distance = selectedOption.distance,
+            canInteract = function(entity, distance, coords, name, bone)
+                if not selectedOption.canInteract then return true end
+                return selectedOption.canInteract(entity, distance, coords, name, bone) == true
+            end,
+            onSelect = function(data)
+                if selectedOption.onSelect then
+                    selectedOption.onSelect(data and data.entity or nil, selectedOption.args)
+                end
+            end
+        }
+    end
+
+    return result, names
+end
+
+local function buildQbGlobalVehicleOptions(options)
+    local result = {}
+    local labels = {}
+
+    for index, option in ipairs(options or {}) do
+        local selectedOption = option
+        labels[index] = selectedOption.label
+        result[index] = {
+            label = selectedOption.label,
+            icon = targetIcon(selectedOption.icon),
+            job = qbTargetJobs(selectedOption.job),
+            canInteract = function(entity, distance, data)
+                if not selectedOption.canInteract then return true end
+                return selectedOption.canInteract(entity, distance, data) == true
+            end,
+            action = function(entity)
+                if selectedOption.onSelect then selectedOption.onSelect(entity, selectedOption.args) end
+            end
+        }
+    end
+
+    return result, labels
+end
+
+
+local function removeGlobalVehicleTarget(handle)
+    if type(handle) ~= 'table' or not handle.provider or GetResourceState(handle.provider) ~= 'started' then return end
+
+    if handle.provider == 'ox_target' then
+        exports.ox_target:removeGlobalVehicle(handle.keys)
+    elseif handle.provider == 'qb-target' then
+        exports['qb-target']:RemoveGlobalVehicle(handle.keys)
+    elseif handle.provider == 'qtarget' then
+        exports.qtarget:RemoveVehicle(handle.keys)
+    end
+end
+
+---Registers provider-normalized options on every networked vehicle.
+---@param namespace string
+---@param options table[]
+---@param distance? number
+---@return table? handle
+function Utils.addGlobalVehicleTarget(namespace, options, distance)
+    local available, provider = Utils.isTargetAvailable(true)
+    if not available then return end
+    if type(namespace) ~= 'string' or namespace == '' or type(options) ~= 'table' or #options == 0 then return end
+
+    globalVehicleTargetSequence += 1
+    namespace = ('%s_%s'):format(namespace:gsub('[^%w_%-]', '_'), globalVehicleTargetSequence)
+
+    local providerOptions, keys
+    if provider == 'ox_target' then
+        providerOptions, keys = buildOxGlobalVehicleOptions(namespace, options)
+    else
+        providerOptions, keys = buildQbGlobalVehicleOptions(options)
+    end
+
+    local ok, errorMessage = pcall(function()
+        if provider == 'ox_target' then
+            exports.ox_target:addGlobalVehicle(providerOptions)
+        elseif provider == 'qb-target' then
+            exports['qb-target']:AddGlobalVehicle({
+                options = providerOptions,
+                distance = distance or 2.5
+            })
+        else
+            exports.qtarget:Vehicle({
+                options = providerOptions,
+                distance = distance or 2.5
+            })
+        end
+    end)
+
+    if not ok then
+        targetWarning(('the %s global vehicle target adapter failed: %s'):format(provider, tostring(errorMessage)))
+        return
+    end
+
+    local handle = { provider = provider, keys = keys }
+    managedGlobalVehicleTargets[handle] = true
+    return handle
+end
+
+function Utils.removeGlobalVehicleTarget(handle)
+    if not managedGlobalVehicleTargets[handle] then return false end
+
+    pcall(removeGlobalVehicleTarget, handle)
+    managedGlobalVehicleTargets[handle] = nil
+    return true
+end
+
 local function cleanupPedPoint(record)
     if record.zoneId then
         pcall(removeTargetZone, record.provider, record.zoneId)
@@ -255,6 +539,7 @@ local function cleanupPedPoint(record)
     end
 
     record.ped = nil
+    if record.model then SetModelAsNoLongerNeeded(record.model) end
 end
 
 function Utils.createPed(coords, model, options)
@@ -264,7 +549,9 @@ function Utils.createPed(coords, model, options)
 
     targetZoneSequence += 1
     local record = {
-        zoneName = ('drs_garage_ped_%s'):format(targetZoneSequence)
+        zoneName = ('drs_garage_ped_%s'):format(targetZoneSequence),
+        model = model,
+        removed = false
     }
 
     record.point = lib.points.new({
@@ -272,6 +559,14 @@ function Utils.createPed(coords, model, options)
         distance = 100.0,
         onEnter = function()
             lib.requestModel(model)
+
+            -- A dynamic property can be removed while requestModel yields.
+            -- Never let that suspended handler recreate an untracked ped/zone.
+            if record.removed or not managedPedPoints[record] then
+                SetModelAsNoLongerNeeded(model)
+                return
+            end
+
             record.ped = CreatePed(4, model, coords.x, coords.y, coords.z - 1.0, coords.w, false, true)
 
             if not record.ped or record.ped == 0 or not DoesEntityExist(record.ped) then
@@ -301,18 +596,33 @@ function Utils.createPed(coords, model, options)
         end,
         onExit = function()
             cleanupPedPoint(record)
-            SetModelAsNoLongerNeeded(model)
         end
     })
 
     managedPedPoints[record] = true
-    return record.point
+    return record
+end
+
+function Utils.removePedPoint(record)
+    if not managedPedPoints[record] then return false end
+
+    record.removed = true
+    cleanupPedPoint(record)
+
+    if record.point then
+        record.point:remove()
+        record.point = nil
+    end
+
+    managedPedPoints[record] = nil
+    return true
 end
 
 AddEventHandler('onResourceStop', function(resource)
     if resource ~= GetCurrentResourceName() then return end
 
     for record in pairs(managedPedPoints) do
+        record.removed = true
         cleanupPedPoint(record)
 
         if record.point then
@@ -322,6 +632,19 @@ AddEventHandler('onResourceStop', function(resource)
     end
 
     managedPedPoints = {}
+
+    for handle in pairs(managedGlobalVehicleTargets) do
+        pcall(removeGlobalVehicleTarget, handle)
+    end
+
+    managedGlobalVehicleTargets = {}
+
+    for handle in pairs(managedRadialOptions) do
+        pcall(removeRadialOption, handle)
+        radialCallbacks[handle.id] = nil
+    end
+
+    managedRadialOptions = {}
 end)
 
 ---@param point1 vector3 | vector4 | number

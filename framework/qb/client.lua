@@ -18,6 +18,20 @@ function Framework.getJob()
     return sharedObject.Functions.GetPlayerData().job.name
 end
 
+function Framework.getJobData()
+    if not Framework.isPlayerLoaded() then return end
+
+    local job = sharedObject.Functions.GetPlayerData().job or {}
+    local grade = type(job.grade) == 'table' and (job.grade.level or job.grade.grade) or job.grade
+
+    return {
+        name = job.name,
+        type = job.type,
+        grade = tonumber(grade) or 0,
+        onDuty = job.onduty == true or job.onDuty == true
+    }
+end
+
 Framework.hasItem = sharedObject.Functions.HasItem
 
 function Framework.spawnVehicle(model, coords, heading, cb)

@@ -25,8 +25,9 @@ Config.Storage = {
     RecoverInaccessibleProperties = true
 }
 
--- Idempotent startup installer. It only adds missing DRS compatibility columns/indexes
--- to an existing QB/Qbox player_vehicles table; it never drops or recreates data.
+-- Idempotent startup installer. It creates the namespaced DRS impound table and
+-- only adds missing compatibility columns/indexes to an existing QB/Qbox
+-- player_vehicles table; it never drops or recreates framework vehicle data.
 Config.Database = {
     AutoMigrate = true
 }
@@ -51,6 +52,37 @@ Config.Integrations = {
 -- Provider selection runs when drs_garages starts. Restart drs_garages after
 -- starting, stopping, removing, or switching a target provider.
 Config.Target = true
+
+-- Nearby garage quality-of-life interactions. Radial providers are detected in
+-- framework order: qbx_radialmenu, qb-radialmenu, then ox_lib's built-in radial.
+-- Each feature can be disabled independently without removing the existing
+-- attendant target, TextUI, or keybind interactions.
+Config.RadialMenu = {
+    Enabled = true,
+    Provider = 'auto', -- auto, qbx_radialmenu, qb-radialmenu, ox_lib
+    Distance = 10.0, -- Public/job garage entry distance; capped to Config.MaxDistance.
+    PropertyDistance = 3.0 -- Property entry distance; capped to PropertyGarageDistance.
+}
+
+Config.Parking = {
+    ProgressDuration = 5000, -- Milliseconds; set to 0 for immediate parking.
+    ProgressCanCancel = true,
+    MaximumSpeed = 0.5, -- Metres per second. Checked by both client and server.
+    TargetEnabled = true,
+    TargetDistance = 3.0
+}
+
+-- Vehicle-list presentation. `auto` uses the compact NUI when it has finished
+-- loading and falls back to the original ox_lib context menu when necessary.
+-- Set Mode to `nui` to prefer only the compact interface or `context` to always
+-- use the original menus.
+Config.Interface = {
+    Mode = 'auto', -- auto, nui, context
+    ContextFallback = true,
+    VehicleShopResource = 'drs_vehicleshop',
+    UseVehicleShopImages = true,
+    UseCfxImages = true
+}
 
 ---@alias VehicleType string
 
@@ -561,8 +593,59 @@ Config.GarageInteriors = {
     }
 }
 
--- Paid redemption is opt-in. Framework cash and vehicle-state changes are not
--- one crash-durable transaction, so a process crash can require manual refund.
+-- Officer/job initiated impounds. The target option is shown only to an
+-- authorized job, but every permission, entity, distance, occupant, ownership,
+-- and fee check is repeated by the server before a vehicle is removed.
+Config.EnforcementImpound = {
+    Enabled = true,
+    Distance = 3.0,
+    MaximumSpeed = 1.0, -- Metres per second; prevents impounding a moving vehicle.
+    Duration = 5000,
+    MinimumReasonLength = 3,
+    MaximumReasonLength = 200,
+    DefaultFee = 500,
+    MinimumFee = 0,
+    MaximumFee = 25000,
+
+    -- Milliseconds, 0-300000. The database/impound record is committed
+    -- immediately, but the empty vehicle remains immobilized in the world for
+    -- this visible tow delay. Use 0 for immediate physical removal.
+    RemovalDelay = 30000,
+
+    -- Natural GTA traffic and parked vehicles can use the same target action.
+    -- They are removed after the delay without creating a player-vehicle,
+    -- DRS impound, or MDT record. Script/mission vehicles fail closed.
+    AmbientVehicles = {
+        Enabled = true,
+        NetworkTimeout = 2000, -- 250-5000ms to promote a local entity for server validation.
+        MaximumDisplacement = 5.0, -- Metres it may move during the tow delay.
+        MaximumPendingPerOfficer = 3, -- Simultaneous unrecorded removals, 1-20.
+        AllowedPopulationTypes = { 1, 2, 3, 4, 5 } -- Natural GTA population only; never mission/script type 7.
+    },
+
+    -- Exact job names work on every supported framework. Add tow/mechanic jobs
+    -- here. Stock ESX has no duty flag and treats its current job as active;
+    -- custom ESX onduty/onDuty values are honored when present.
+    Jobs = {
+        police = { MinGrade = 0, RequireDuty = true },
+        -- sheriff = { MinGrade = 0, RequireDuty = true },
+        -- tow = { MinGrade = 0, RequireDuty = false },
+    },
+
+    -- Qbox exposes job types. `leo` automatically covers every configured law
+    -- enforcement department without hard-coding each department name.
+    JobTypes = {
+        leo = { MinGrade = 0, RequireDuty = true }
+    },
+
+    -- A QB/Qbox state-2 vehicle without a DRS release record is treated as an
+    -- authority hold. This preserves legacy `/impound` and MDT seizure intent.
+    LegacyStateTwoHold = true
+}
+
+-- Legacy/natural impounds without a recorded per-vehicle fee use this fallback.
+-- Framework cash and vehicle-state changes are not one crash-durable transaction,
+-- so a process crash during paid recovery can still require manual review.
 Config.ImpoundPrice = 0
 
 ---@class ImpoundData : LocationData

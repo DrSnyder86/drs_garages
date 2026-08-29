@@ -1,6 +1,7 @@
 local RESOURCE_NAME = GetCurrentResourceName()
 local TABLE_NAME = 'player_vehicles'
 local ESX_TABLE_NAME = 'owned_vehicles'
+local IMPOUND_TABLE_NAME = 'drs_vehicle_impounds'
 local CONNECTION_ATTEMPTS = 20
 local CONNECTION_RETRY_DELAY = 250
 local SUPPORTED_CORE_RESOURCES = { 'qbx_core', 'qb-core', 'es_extended' }
@@ -45,10 +46,52 @@ local UNIQUE_PLATE_INDEX_NAMES = {
     [ESX_TABLE_NAME] = 'ux_owned_vehicles_plate'
 }
 
+local IMPOUND_COLUMNS = {
+    'impound_id',
+    'plate',
+    'vehicle_row_id',
+    'ownership_type',
+    'owner_key',
+    'reason',
+    'fee',
+    'release_mode',
+    'impounded_by_identifier',
+    'impounded_by_name',
+    'impounded_by_job',
+    'impounded_by_grade',
+    'source_resource',
+    'impounded_at'
+}
+
+local IMPOUND_TABLE_SQL = [[
+    CREATE TABLE IF NOT EXISTS `drs_vehicle_impounds` (
+        `impound_id` VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+        `plate` VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+        `vehicle_row_id` VARCHAR(64) NOT NULL,
+        `ownership_type` VARCHAR(16) NOT NULL,
+        `owner_key` VARCHAR(80) NOT NULL,
+        `reason` VARCHAR(500) NOT NULL,
+        `fee` INT UNSIGNED NOT NULL DEFAULT 0,
+        `release_mode` VARCHAR(16) NOT NULL DEFAULT 'payable',
+        `impounded_by_identifier` VARCHAR(80) NOT NULL,
+        `impounded_by_name` VARCHAR(100) NOT NULL,
+        `impounded_by_job` VARCHAR(50) NOT NULL,
+        `impounded_by_grade` INT NOT NULL DEFAULT 0,
+        `source_resource` VARCHAR(64) NOT NULL DEFAULT 'drs_garages',
+        `impounded_at` BIGINT UNSIGNED NOT NULL,
+        PRIMARY KEY (`impound_id`),
+        UNIQUE KEY `ux_drs_vehicle_impounds_plate` (`plate`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+]]
+
 local migrationComplete = false
 local migrationSuccessful = false
 local migrationDetail = 'database setup is still running'
 local readyPromise = promise.new()
+local vehicleCapabilities = {
+    id = false,
+    depotprice = false
+}
 
 ---@class DRSGaragesDatabaseApi
 ---@field isReady fun(): boolean
@@ -100,8 +143,20 @@ function DRSGaragesDatabase.getStatus()
         successful = migrationSuccessful,
         detail = migrationDetail,
         autoMigrate = not (type(databaseConfig) == 'table' and databaseConfig.AutoMigrate == false),
-        framework = type(Framework) == 'table' and Framework.name or nil
+        framework = type(Framework) == 'table' and Framework.name or nil,
+        vehicleCapabilities = {
+            id = vehicleCapabilities.id == true,
+            depotprice = vehicleCapabilities.depotprice == true
+        }
     }
+end
+
+---Returns whether the active framework vehicle table exposes an optional column.
+---@param columnName string
+---@return boolean
+function DRSGaragesDatabase.hasVehicleColumn(columnName)
+    if not migrationComplete or not migrationSuccessful or type(columnName) ~= 'string' then return false end
+    return vehicleCapabilities[columnName:lower()] == true
 end
 
 local function log(message)
@@ -203,6 +258,30 @@ local function tableExists(schemaName, tableName)
 end
 
 ---@param schemaName string
+---@param tableName string
+---@return string? engine
+---@return string? errorMessage
+local function getTableEngine(schemaName, tableName)
+    local successful, rows = query([[
+        SELECT ENGINE AS `engine`
+        FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+        LIMIT 1
+    ]], { schemaName, tableName })
+
+    if not successful then
+        return nil, ('could not inspect the storage engine for `%s`: %s'):format(tableName, rows)
+    end
+
+    local engine = rows and rows[1] and rows[1].engine
+    if type(engine) ~= 'string' or engine == '' then
+        return nil, ('could not determine the storage engine for `%s`'):format(tableName)
+    end
+
+    return engine
+end
+
+---@param schemaName string
 ---@param tableName? string
 ---@return table<string, table>? columns
 ---@return string? errorMessage
@@ -260,6 +339,14 @@ local INTEGER_DATA_TYPES = {
     integer = true,
     bigint = true
 }
+local INTEGER_TYPE_RANKS = {
+    tinyint = 1,
+    smallint = 2,
+    mediumint = 3,
+    int = 4,
+    integer = 4,
+    bigint = 5
+}
 local QB_COLUMN_REQUIREMENTS = {
     citizenid = { kind = 'text', minimumLength = 50 },
     license = { kind = 'text', minimumLength = 50 },
@@ -286,6 +373,22 @@ local ESX_COLUMN_REQUIREMENTS = {
     vehicle = { kind = 'text', minimumLength = 65535 },
     stored = { kind = 'integer', nullable = false },
     job = { kind = 'text', minimumLength = 20, nullable = true, nullDefault = true }
+}
+local IMPOUND_COLUMN_REQUIREMENTS = {
+    impound_id = { kind = 'text', minimumLength = 64, nullable = false },
+    plate = { kind = 'text', minimumLength = 8, nullable = false },
+    vehicle_row_id = { kind = 'text', minimumLength = 64, nullable = false },
+    ownership_type = { kind = 'text', minimumLength = 16, nullable = false },
+    owner_key = { kind = 'text', minimumLength = 80, nullable = false },
+    reason = { kind = 'text', minimumLength = 500, nullable = false },
+    fee = { kind = 'integer', minimumIntegerRank = 4, unsigned = true, nullable = false },
+    release_mode = { kind = 'text', minimumLength = 16, nullable = false },
+    impounded_by_identifier = { kind = 'text', minimumLength = 80, nullable = false },
+    impounded_by_name = { kind = 'text', minimumLength = 100, nullable = false },
+    impounded_by_job = { kind = 'text', minimumLength = 50, nullable = false },
+    impounded_by_grade = { kind = 'integer', nullable = false },
+    source_resource = { kind = 'text', minimumLength = 64, nullable = false },
+    impounded_at = { kind = 'integer', minimumIntegerRank = 5, unsigned = true, nullable = false }
 }
 
 local function textColumnHasCapacity(column, minimumLength)
@@ -328,6 +431,14 @@ local function validateColumnDefinitions(columns, requirements)
             valid = textColumnHasCapacity(column, requirement.minimumLength or 1)
         elseif valid and requirement.kind == 'integer' then
             valid = INTEGER_DATA_TYPES[column.dataType] == true
+            if valid and requirement.minimumIntegerRank then
+                valid = (INTEGER_TYPE_RANKS[column.dataType] or 0) >= requirement.minimumIntegerRank
+            end
+            if valid and requirement.unsigned ~= nil then
+                local isUnsigned = type(column.columnType) == 'string'
+                    and column.columnType:find('unsigned', 1, true) ~= nil
+                valid = isUnsigned == requirement.unsigned
+            end
         end
 
         if valid and requirement.nullable ~= nil then
@@ -640,6 +751,132 @@ local function indexMatches(actual, expected)
     return true
 end
 
+local findMissingColumns
+
+local function uniqueIndexMatches(actual, expected)
+    if not actual or actual.nonUnique or #actual.columns ~= #expected then return false end
+
+    for index, columnName in ipairs(expected) do
+        if actual.columns[index] ~= columnName or actual.subParts[index] ~= nil then return false end
+    end
+
+    return true
+end
+
+local function validateImpoundRows()
+    local successful, rows = query([[
+        SELECT COUNT(*) AS `invalid_count`
+        FROM `drs_vehicle_impounds`
+        WHERE `impound_id` IS NULL OR TRIM(`impound_id`) = ''
+           OR `plate` IS NULL OR TRIM(`plate`) = ''
+           OR CHAR_LENGTH(TRIM(`plate`)) > 8
+           OR BINARY `plate` <> BINARY UPPER(TRIM(`plate`))
+           OR `plate` NOT REGEXP '^[A-Z0-9 ]+$'
+           OR `vehicle_row_id` IS NULL OR TRIM(`vehicle_row_id`) = ''
+           OR `ownership_type` IS NULL
+           OR (BINARY `ownership_type` <> BINARY 'personal' AND BINARY `ownership_type` <> BINARY 'society')
+           OR `owner_key` IS NULL OR TRIM(`owner_key`) = ''
+           OR `reason` IS NULL OR TRIM(`reason`) = ''
+           OR `release_mode` IS NULL
+           OR (BINARY `release_mode` <> BINARY 'payable' AND BINARY `release_mode` <> BINARY 'hold')
+           OR `fee` IS NULL OR `fee` < 0
+           OR `impounded_by_identifier` IS NULL OR TRIM(`impounded_by_identifier`) = ''
+           OR `impounded_by_name` IS NULL OR TRIM(`impounded_by_name`) = ''
+           OR `impounded_by_job` IS NULL OR TRIM(`impounded_by_job`) = ''
+           OR `source_resource` IS NULL OR TRIM(`source_resource`) = ''
+           OR `impounded_at` IS NULL OR `impounded_at` < 1
+    ]])
+    local invalidCount = successful and rows and rows[1] and tonumber(rows[1].invalid_count) or nil
+
+    if not successful or not invalidCount then
+        return false, ('could not validate `%s` rows: %s'):format(IMPOUND_TABLE_NAME, tostring(rows))
+    end
+
+    if invalidCount > 0 then
+        return false, ('`%s` contains %d invalid active record(s). Back up and repair those records before restarting DRS Garages.'):format(
+            IMPOUND_TABLE_NAME,
+            invalidCount
+        )
+    end
+
+    return true
+end
+
+local function ensureImpoundSchema(schemaName, autoMigrate)
+    local exists, existsError = tableExists(schemaName, IMPOUND_TABLE_NAME)
+    if exists == nil then return false, existsError end
+
+    if not exists then
+        if not autoMigrate then
+            return false, ('automatic migration is disabled and `%s` is missing. Import sql/drs_vehicle_impounds.sql, then restart DRS Garages.'):format(
+                IMPOUND_TABLE_NAME
+            )
+        end
+
+        local created, createError = query(IMPOUND_TABLE_SQL)
+        if not created then
+            return false, ('could not create `%s`: %s. Grant CREATE permission or import sql/drs_vehicle_impounds.sql manually.'):format(
+                IMPOUND_TABLE_NAME,
+                tostring(createError)
+            )
+        end
+
+        log(('Created `%s` for server-authoritative impound records.'):format(IMPOUND_TABLE_NAME))
+    end
+
+    local columns, columnError = getColumns(schemaName, IMPOUND_TABLE_NAME)
+    if not columns then return false, columnError end
+
+    local missing = findMissingColumns(columns, IMPOUND_COLUMNS)
+    if #missing > 0 then
+        return false, ('`%s` is missing required column(s): %s. Import sql/drs_vehicle_impounds.sql into a clean table or repair it manually.'):format(
+            IMPOUND_TABLE_NAME,
+            join(missing)
+        )
+    end
+
+    local definitionsValid, invalidDefinitions = validateColumnDefinitions(columns, IMPOUND_COLUMN_REQUIREMENTS)
+    if not definitionsValid then
+        return false, invalidColumnDefinitionsMessage(IMPOUND_TABLE_NAME, invalidDefinitions)
+    end
+
+    local indexes, indexError = getIndexes(schemaName, IMPOUND_TABLE_NAME)
+    if not indexes then return false, indexError end
+    if not uniqueIndexMatches(indexes.primary, { 'impound_id' }) then
+        return false, ('`%s` needs an exact full-column PRIMARY KEY on `impound_id`. Automatic migration will not replace an incompatible key.'):format(IMPOUND_TABLE_NAME)
+    end
+    if not uniqueIndexMatches(indexes.ux_drs_vehicle_impounds_plate, { 'plate' }) then
+        return false, ('`%s` needs the exact UNIQUE full-column index `ux_drs_vehicle_impounds_plate` on `plate`. Automatic migration will not replace an incompatible index.'):format(IMPOUND_TABLE_NAME)
+    end
+
+    local rowsValid, rowsError = validateImpoundRows()
+    if not rowsValid then return false, rowsError end
+
+    return true, 'enforcement impound schema is ready'
+end
+
+local function finalizeSchema(schemaName, autoMigrate, vehicleSchemaReady, vehicleDetail)
+    if not vehicleSchemaReady then return false, vehicleDetail end
+
+    local impoundReady, impoundDetail = ensureImpoundSchema(schemaName, autoMigrate)
+    if not impoundReady then return false, impoundDetail end
+
+    local vehicleTableName = Framework.name == 'es_extended' and ESX_TABLE_NAME or TABLE_NAME
+    for _, tableName in ipairs({ vehicleTableName, IMPOUND_TABLE_NAME }) do
+        local engine, engineError = getTableEngine(schemaName, tableName)
+        if not engine then return false, engineError end
+        if engine:lower() ~= 'innodb' then
+            return false, ('`%s` uses the nontransactional or unsupported `%s` storage engine. Back up the database and convert both the framework vehicle table and `%s` to InnoDB before restarting DRS Garages.'):format(
+                tableName,
+                engine,
+                IMPOUND_TABLE_NAME
+            )
+        end
+    end
+
+    return true, ('%s; %s; transactional storage engines are ready'):format(vehicleDetail, impoundDetail)
+end
+
 local SHARED_TYPE_TO_GARAGE_TYPE = {
     automobile = 'car',
     bike = 'car',
@@ -940,7 +1177,7 @@ end
 ---@param columns table<string, boolean>
 ---@param required string[]
 ---@return string[] missing
-local function findMissingColumns(columns, required)
+findMissingColumns = function(columns, required)
     local missing = {}
 
     for _, columnName in ipairs(required) do
@@ -1116,6 +1353,11 @@ local function validateEsxSchema(schemaName, autoMigrate)
     local columns, columnError = getColumns(schemaName, ESX_TABLE_NAME)
     if not columns then return false, columnError end
 
+    vehicleCapabilities.id = columns.id ~= nil
+    -- `depotprice` is a QB/Qbox police-depot contract. An unrelated ESX column
+    -- with that name must not become a recurring DRS recovery charge.
+    vehicleCapabilities.depotprice = false
+
     local missing = findMissingColumns(columns, ESX_REQUIRED_COLUMNS)
     if #missing > 0 then
         return false, ("`%s` is missing required runtime column(s): %s. DRS Garages does not add missing ESX columns automatically."):format(
@@ -1209,7 +1451,8 @@ local function migrate()
 
     if frameworkName == 'es_extended' then
         log('ESX detected; validating owned_vehicles without applying QB/Qbox migrations.')
-        return validateEsxSchema(schemaName, autoMigrate)
+        local vehicleReady, vehicleDetail = validateEsxSchema(schemaName, autoMigrate)
+        return finalizeSchema(schemaName, autoMigrate, vehicleReady, vehicleDetail)
     end
 
     local exists, tableError = tableExists(schemaName)
@@ -1225,6 +1468,10 @@ local function migrate()
     if not columns then
         return false, columnError
     end
+
+
+    vehicleCapabilities.id = columns.id ~= nil
+    vehicleCapabilities.depotprice = columns.depotprice ~= nil and INTEGER_DATA_TYPES[columns.depotprice.dataType] == true
 
     local missingBaseColumns = {}
     for _, columnName in ipairs(BASE_COLUMNS) do
@@ -1293,8 +1540,11 @@ local function migrate()
             return false, ('automatic migration is disabled and the plate invariant is not ready: %s'):format(uniquePlateDetail)
         end
 
-        return true, ('database schema is ready (automatic migration disabled; read-only validation passed; %s)'):format(
-            uniquePlateDetail
+        return finalizeSchema(
+            schemaName,
+            autoMigrate,
+            true,
+            ('database schema is ready (automatic migration disabled; read-only validation passed; %s)'):format(uniquePlateDetail)
         )
     end
 
@@ -1350,6 +1600,8 @@ local function migrate()
         return false, ('could not verify compatibility columns after migration: %s'):format(tostring(refreshColumnError))
     end
     columns = refreshedColumns
+    vehicleCapabilities.id = columns.id ~= nil
+    vehicleCapabilities.depotprice = columns.depotprice ~= nil and INTEGER_DATA_TYPES[columns.depotprice.dataType] == true
 
     local definitionsValid, invalidDefinitions = validateColumnDefinitions(columns, QB_COLUMN_REQUIREMENTS)
     if not definitionsValid then
@@ -1428,7 +1680,7 @@ local function migrate()
         return false, ('could not verify compatibility index(es): %s. Inspect information_schema.STATISTICS and apply the SQL manually.'):format(join(unverifiedIndexes))
     end
 
-    return true, 'database schema is ready'
+    return finalizeSchema(schemaName, autoMigrate, true, 'database schema is ready')
 end
 
 local function settle(successful, detail)

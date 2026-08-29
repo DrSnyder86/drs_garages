@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>DRS Garages</title>
+        <link rel="stylesheet" href="style.css" />
+    </head>
+    <body>
+        <main
+            id="app"
+            class="app is-hidden"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="garageTitle"
+            aria-describedby="garageSubtitle"
+            aria-hidden="true"
+            tabindex="-1"
+        >
+            <section class="garage-panel">
+                <header class="panel-header">
+                    <div class="brand-mark" aria-hidden="true">
+                        <svg viewBox="0 0 40 40" role="presentation">
+                            <path d="M7.5 24.5h25l-2.1-7.1a4 4 0 0 0-3.8-2.9H13.4a4 4 0 0 0-3.8 2.9l-2.1 7.1Z" />
+                            <path d="M10 24.5v3.75M30 24.5v3.75M12.5 21h2M25.5 21h2" />
+                        </svg>
+                    </div>
+
+                    <div class="header-copy">
+                        <span id="modeLabel" class="eyebrow">Vehicle garage</span>
+                        <h1 id="garageTitle">DRS Garages</h1>
+                        <p id="garageSubtitle">Select a vehicle</p>
+                    </div>
+
+                    <button id="closeButton" class="icon-button" type="button" aria-label="Close garage">
+                        <svg viewBox="0 0 20 20" aria-hidden="true">
+                            <path d="m5 5 10 10M15 5 5 15" />
+                        </svg>
+                    </button>
+                </header>
+
+                <nav id="scopeTabs" class="scope-tabs is-hidden" aria-label="Vehicle ownership"></nav>
+
+                <div class="toolbar">
+                    <label class="search-control" for="searchInput">
+                        <svg viewBox="0 0 20 20" aria-hidden="true">
+                            <circle cx="8.5" cy="8.5" r="5.25" />
+                            <path d="m12.5 12.5 4 4" />
+                        </svg>
+                        <span class="sr-only">Search vehicles</span>
+                        <input
+                            id="searchInput"
+                            type="search"
+                            placeholder="Search by vehicle, model, or plate"
+                            autocomplete="off"
+                            spellcheck="false"
+                        />
+                        <span class="key-hint" aria-hidden="true">/</span>
+                    </label>
+
+                    <label class="sort-control" for="sortSelect">
+                        <span class="sr-only">Sort vehicles</span>
+                        <select id="sortSelect">
+                            <option value="status">Sort: Status</option>
+                            <option value="name-asc">Name A–Z</option>
+                            <option value="name-desc">Name Z–A</option>
+                            <option value="fuel-desc">Fuel: High–low</option>
+                            <option value="fuel-asc">Fuel: Low–high</option>
+                        </select>
+                        <svg viewBox="0 0 20 20" aria-hidden="true">
+                            <path d="m6.5 8 3.5 3.5L13.5 8" />
+                        </svg>
+                    </label>
+                </div>
+
+                <div class="list-summary" role="status" aria-live="polite">
+                    <div class="summary-count">
+                        <span class="status-pulse" aria-hidden="true"></span>
+                        <span id="vehicleCount">0 vehicles</span>
+                    </div>
+                    <span id="imageSource" class="image-source is-hidden"></span>
+                </div>
+
+                <section id="vehicleList" class="vehicle-list" aria-label="Vehicles"></section>
+
+                <section id="emptyState" class="empty-state is-hidden" aria-live="polite">
+                    <img src="assets/vehicle-placeholder.svg" alt="" />
+                    <h2 id="emptyTitle">No vehicles found</h2>
+                    <p id="emptyMessage">Try changing your search.</p>
+                    <button id="clearSearchButton" class="secondary-button" type="button">Clear search</button>
+                </section>
+
+                <div id="busyLayer" class="busy-layer is-hidden" role="status" aria-live="polite">
+                    <span class="spinner" aria-hidden="true"></span>
+                    <span id="busyLabel">Working…</span>
+                </div>
+
+                <footer class="panel-footer">
+                    <span><kbd>Esc</kbd> Close</span>
+                    <span><kbd>/</kbd> Search</span>
+                </footer>
+            </section>
+        </main>
+
+        <script src="script.js"></script>
+    </body>
+</html>

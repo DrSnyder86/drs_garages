@@ -78,6 +78,21 @@ function player:getJob()
     return self.xPlayer.getJob().name
 end
 
+function player:getJobData()
+    local job = self.xPlayer.getJob() or {}
+    local duty = job.onduty
+    if duty == nil then duty = job.onDuty end
+
+    return {
+        name = job.name,
+        type = job.type,
+        grade = tonumber(job.grade) or 0,
+        -- Stock ESX has no universal duty state, so an absent flag means the
+        -- current job is active. Custom ESX duty flags are still enforced.
+        onDuty = duty == nil or duty == true or duty == 1 or duty == 'true'
+    }
+end
+
 function player:isJobBoss()
     local job = self.xPlayer.getJob()
     return job and (job.isboss == true or job.grade_name == 'boss') or false

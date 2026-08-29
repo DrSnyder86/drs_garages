@@ -36,3 +36,50 @@ for key, query in pairs(Queries) do
         Queries[key] = Queries[key]:gsub('owner', 'citizenid')
     end
 end
+
+-- DRS-owned impound metadata is deliberately kept outside the framework query
+-- formatter above. In particular, the QB owner->citizenid replacement must
+-- never rewrite identifiers or columns in this table.
+ImpoundQueries = {
+    getByPlate = [[
+        SELECT `impound_id`, `plate`, `vehicle_row_id`, `ownership_type`, `owner_key`,
+               `reason`, `fee`, `release_mode`, `impounded_by_identifier`, `impounded_by_name`,
+               `impounded_by_job`, `impounded_by_grade`, `source_resource`, `impounded_at`
+        FROM `drs_vehicle_impounds`
+        WHERE `plate` = ?
+        LIMIT 1
+    ]],
+    getAll = [[
+        SELECT `impound_id`, `plate`, `vehicle_row_id`, `ownership_type`, `owner_key`,
+               `reason`, `fee`, `release_mode`, `impounded_by_identifier`, `impounded_by_name`,
+               `impounded_by_job`, `impounded_by_grade`, `source_resource`, `impounded_at`
+        FROM `drs_vehicle_impounds`
+    ]],
+    insert = [[
+        INSERT INTO `drs_vehicle_impounds`
+            (`impound_id`, `plate`, `vehicle_row_id`, `ownership_type`, `owner_key`,
+             `reason`, `fee`, `release_mode`, `impounded_by_identifier`,
+             `impounded_by_name`, `impounded_by_job`, `impounded_by_grade`,
+             `source_resource`, `impounded_at`)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ]],
+    insertAfterChangedRow = [[
+        INSERT INTO `drs_vehicle_impounds`
+            (`impound_id`, `plate`, `vehicle_row_id`, `ownership_type`, `owner_key`,
+             `reason`, `fee`, `release_mode`, `impounded_by_identifier`,
+             `impounded_by_name`, `impounded_by_job`, `impounded_by_grade`,
+             `source_resource`, `impounded_at`)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE ROW_COUNT() = 1
+    ]],
+    deleteExact = [[
+        DELETE FROM `drs_vehicle_impounds`
+        WHERE `impound_id` = ? AND `plate` = ?
+        LIMIT 1
+    ]],
+    deleteExactAfterChangedRow = [[
+        DELETE FROM `drs_vehicle_impounds`
+        WHERE `impound_id` = ? AND `plate` = ? AND ROW_COUNT() = 1
+        LIMIT 1
+    ]]
+}

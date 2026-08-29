@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180" role="img" aria-label="Vehicle image unavailable">
+    <defs>
+        <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#1d2022" />
+            <stop offset="1" stop-color="#0d0f10" />
+        </linearGradient>
+        <linearGradient id="body" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stop-color="#5c6368" />
+            <stop offset="0.5" stop-color="#949ba0" />
+            <stop offset="1" stop-color="#4c5256" />
+        </linearGradient>
+    </defs>
+    <rect width="320" height="180" rx="12" fill="url(#background)" />
+    <path d="M69 109h180l-8-27c-3-10-12-16-22-16h-85c-10 0-18 5-23 14l-14 29H69Z" fill="url(#body)" opacity=".58" />
+    <path d="m124 73-13 31h105l-9-31h-83Z" fill="#202427" opacity=".9" />
+    <path d="M70 105c-8 1-14 8-14 16v10c0 7 5 12 12 12h184c7 0 12-5 12-12v-9c0-9-7-16-16-17H70Z" fill="url(#body)" opacity=".82" />
+    <path d="M81 119h35M207 119h35" stroke="#dfe5e7" stroke-width="5" stroke-linecap="round" opacity=".62" />
+    <circle cx="99" cy="142" r="16" fill="#08090a" />
+    <circle cx="99" cy="142" r="7" fill="#555c61" />
+    <circle cx="225" cy="142" r="16" fill="#08090a" />
+    <circle cx="225" cy="142" r="7" fill="#555c61" />
+    <path d="M140 124h40" stroke="#181b1d" stroke-width="4" stroke-linecap="round" opacity=".7" />
+</svg>

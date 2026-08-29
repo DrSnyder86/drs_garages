@@ -59,6 +59,21 @@ function Framework.getJob()
     return false
 end
 
+function Framework.getJobData()
+    local data = RefreshPlayerData()
+    local job = data and data.job or {}
+    local grade = type(job.grade) == 'table' and (job.grade.level or job.grade.grade) or job.grade
+
+    if not job.name then return end
+
+    return {
+        name = job.name,
+        type = job.type,
+        grade = tonumber(grade) or 0,
+        onDuty = job.onduty == true or job.onDuty == true
+    }
+end
+
 function Framework.hasGroup(filter)
     if GetResourceState('qbx_core') ~= 'started' then return false end
 

@@ -118,6 +118,18 @@ function player:getJob()
     return self.QBPlayer.PlayerData.job.name
 end
 
+function player:getJobData()
+    local job = self.QBPlayer.PlayerData.job or {}
+    local grade = type(job.grade) == 'table' and (job.grade.level or job.grade.grade) or job.grade
+
+    return {
+        name = job.name,
+        type = job.type,
+        grade = tonumber(grade) or 0,
+        onDuty = job.onduty == true or job.onDuty == true
+    }
+end
+
 function player:isJobBoss()
     local job = self.QBPlayer.PlayerData.job
     return job and job.isboss == true or false

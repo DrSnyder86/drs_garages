@@ -5,7 +5,7 @@ lua54 'yes'
 
 author 'DRS'
 description 'DRS Garages - multi-framework vehicle garage system'
-version '2.2.0-drs.3'
+version '2.5.0-drs.1'
 
 dependencies {
     'ox_lib',
@@ -13,8 +13,14 @@ dependencies {
     '/onesync'
 }
 
+ui_page 'html/index.html'
+
 files {
-    'locales/*.json'
+    'locales/*.json',
+    'html/index.html',
+    'html/style.css',
+    'html/script.js',
+    'html/assets/*.svg'
 }
 
 shared_scripts {

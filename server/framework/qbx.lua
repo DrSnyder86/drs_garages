@@ -134,6 +134,18 @@ function player:getJob()
     return self.PlayerData.job and self.PlayerData.job.name or 'unemployed'
 end
 
+function player:getJobData()
+    local job = self.PlayerData.job or {}
+    local grade = type(job.grade) == 'table' and (job.grade.level or job.grade.grade) or job.grade
+
+    return {
+        name = job.name,
+        type = job.type,
+        grade = tonumber(grade) or 0,
+        onDuty = job.onduty == true or job.onDuty == true
+    }
+end
+
 function player:isJobBoss()
     local job = self.PlayerData.job
     return job and job.isboss == true or false

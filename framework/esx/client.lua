@@ -34,6 +34,25 @@ Framework.getJob = function()
     return playerData and playerData.job and playerData.job.name or false
 end
 
+Framework.getJobData = function()
+    if not Framework.isPlayerLoaded() then return end
+
+    local playerData = sharedObject.GetPlayerData()
+    local job = playerData and playerData.job or {}
+    if not job.name then return end
+    local duty = job.onduty
+    if duty == nil then duty = job.onDuty end
+
+    return {
+        name = job.name,
+        type = job.type,
+        grade = tonumber(job.grade) or 0,
+        -- Stock ESX has no universal duty state, so an absent flag means the
+        -- current job is active. Custom ESX duty flags are still enforced.
+        onDuty = duty == nil or duty == true or duty == 1 or duty == 'true'
+    }
+end
+
 Framework.hasItem = function(name)
     local playerData = sharedObject.GetPlayerData()
     for k,v in ipairs(playerData.inventory) do

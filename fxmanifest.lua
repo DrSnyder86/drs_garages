@@ -5,7 +5,7 @@ lua54 'yes'
 
 author 'DRS'
 description 'DRS Garages - multi-framework vehicle garage system'
-version '2.5.0-drs.1'
+version '2.6.0-drs.1'
 
 dependencies {
     'ox_lib',

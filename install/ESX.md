@@ -90,20 +90,19 @@ There is no default ESX vehicle-key handoff in this build. Either set
 `config/cl_edit.lua` for the key resource used by your server. The doctor
 reports this as a warning.
 
-Contracts are disabled by default because framework money, inventory, and
-ownership calls cannot be committed as one atomic, crash-durable transaction.
-Enable them only after accepting that a process crash during a transfer can
-require administrator reconciliation.
+Contract V2 is enabled with only boss society donations active; player sales and
+society withdrawals remain separate opt-ins. Multi-step results are written to
+the DRS contract journal for startup reconciliation and explicit administrator
+review when an outcome cannot be proven.
 
-When `Config.Contract.Enabled = true`, create the item named by
-`Config.Contract.Item` in the ESX inventory system and add its image when the UI
-requires one.
+Create the item named by `Config.Contract.Item` in the ESX inventory system and
+add its image when the UI requires one. See [`ContractItem.md`](ContractItem.md).
 
 Contract vehicle validation uses `Config.Contract.VehicleDistance = 5.0` by
 default, plus the server's standard `2.0`-metre network tolerance, for a default
 effective upper bound of `7.0` metres from the active vehicle.
-`Config.Contract.SocietyWithdrawalRequiresBoss = true` permits only a current
-boss of the matching job to privatize a society vehicle.
+The supplied `SocietyWithdrawalPermission = 'admin'` requires the
+`drs_garages.contract.admin` ACE if that action is enabled.
 
 ## Verify
 
@@ -111,6 +110,8 @@ Run `drsgarages:doctor` in the server console after startup. For in-game use:
 
 ```cfg
 add_ace group.admin command.drsgarages:doctor allow
+add_ace group.admin drs_garages.contract.admin allow
+add_ace group.admin drs_garages.fleet.admin allow
 ```
 
 Resolve every FAIL, then test a personal and society vehicle through parking,

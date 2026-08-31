@@ -702,6 +702,33 @@ local function vehicleMatchesOwnershipMode(vehicle, player, society)
     return not vehicle.job or vehicle.job == ''
 end
 
+local function jobFleetEnabled()
+    return type(Config.JobFleet) == 'table' and Config.JobFleet.Enabled ~= false
+end
+
+local function canAccessJobFleetVehicle(source, vehicle)
+    if not vehicle or not vehicle.job or vehicle.job == '' then return true end
+
+    local checker = rawget(_G, 'CanAccessDrsFleetVehicle')
+    if type(checker) ~= 'function' then
+        -- A partially loaded fleet service must never expose society assets.
+        return not jobFleetEnabled()
+    end
+
+    local ok, allowed = pcall(checker, source, vehicle)
+    return ok and allowed == true
+end
+
+local function getJobFleetMetadata(vehicle)
+    if not vehicle or not vehicle.job or vehicle.job == '' then return end
+
+    local provider = rawget(_G, 'GetDrsFleetVehicleMetadata')
+    if type(provider) ~= 'function' then return end
+
+    local ok, metadata = pcall(provider, vehicle)
+    return ok and type(metadata) == 'table' and metadata or nil
+end
+
 local function canAccessGarage(source, garage)
     local player = Framework.getPlayerFromId(source)
     if not player then return false end
@@ -952,6 +979,32 @@ local function isExactActiveVehicle(plate, entity)
     return activeVehicles[plate] == entity
 end
 
+local function isDurableOperationPlateBlocked(rawPlate)
+    local plate = normalizePlate(rawPlate)
+    if not plate then return true end
+
+    local checks = {
+        {
+            expected = type(Config.Contract) == 'table',
+            callback = rawget(_G, 'IsDrsGarageContractPlateBlocked')
+        },
+        {
+            expected = type(Config.JobFleet) == 'table' and Config.JobFleet.Enabled ~= false,
+            callback = rawget(_G, 'IsDrsGarageFleetPlateBlocked')
+        }
+    }
+
+    for _, check in ipairs(checks) do
+        if check.expected then
+            if type(check.callback) ~= 'function' then return true end
+            local ok, blocked = pcall(check.callback, plate)
+            if not ok or blocked ~= false then return true end
+        end
+    end
+
+    return false
+end
+
 local function isVehicleStorageInProgress(plate)
     plate = normalizePlate(plate)
 
@@ -960,6 +1013,7 @@ local function isVehicleStorageInProgress(plate)
         or getRetrievalOperation(plate) ~= nil
         or vehicleExternalOperations[plate] ~= nil
         or vehicleReconciliationQuarantine[plate] ~= nil
+        or isDurableOperationPlateBlocked(plate)
     ) or false
 end
 
@@ -1250,6 +1304,8 @@ function BuildDrsGarageClientVehicles(vehicles)
     local clientVehicles = {}
 
     for _, storedVehicle in ipairs(type(vehicles) == 'table' and vehicles or {}) do
+        local fleetMetadata = getJobFleetMetadata(storedVehicle)
+
         clientVehicles[#clientVehicles + 1] = {
             plate = storedVehicle.plate,
             mods = storedVehicle.mods,
@@ -1261,7 +1317,10 @@ function BuildDrsGarageClientVehicles(vehicles)
             impounded_by_name = storedVehicle.impounded_by_name,
             impounded_by_job = storedVehicle.impounded_by_job,
             impounded_at = storedVehicle.impounded_at,
-            impounded_at_label = storedVehicle.impounded_at_label
+            impounded_at_label = storedVehicle.impounded_at_label,
+            fleet_managed = fleetMetadata ~= nil,
+            fleet_min_grade = fleetMetadata and tonumber(fleetMetadata.minGrade) or nil,
+            fleet_garage = fleetMetadata and fleetMetadata.garage or nil
         }
     end
 
@@ -1758,6 +1817,20 @@ end
 local function vehicleVisibleAtGarage(vehicle, index, garage, player, society)
     if not vehicle or not garage or not player or not rowTypeMatchesGarage(vehicle, garage) then return false end
 
+    -- Managed fleet assets always honor their explicit assignment, even when
+    -- personal storage remains globally visible. Legacy job rows retain the
+    -- configured storage policy until a boss/admin adopts them in Fleet Manager.
+    if society == true then
+        local metadata = getJobFleetMetadata(vehicle)
+        if metadata then
+            if metadata.status ~= 'active' then return false end
+
+            local targetName = normalizeStorageName(garageStorageName(index, garage))
+            local assignedName = normalizeStorageName(metadata.garage)
+            return targetName ~= nil and assignedName == targetName
+        end
+    end
+
     local mode = getStorageMode()
     if mode == 'global' then return true end
 
@@ -1808,7 +1881,10 @@ function FilterDrsGarageVehicles(source, index, vehicles, society)
     local filtered = {}
 
     for _, vehicle in ipairs(type(vehicles) == 'table' and vehicles or {}) do
-        if vehicleVisibleAtGarage(vehicle, index, garage, player, society == true) then
+        if vehicleVisibleAtGarage(vehicle, index, garage, player, society == true)
+            and not isDurableOperationPlateBlocked(vehicle.plate)
+            and (society ~= true or canAccessJobFleetVehicle(source, vehicle))
+        then
             filtered[#filtered + 1] = vehicle
         end
     end
@@ -2265,6 +2341,7 @@ local function moveOutVehiclesIntoGarages(returnMissing)
     local recovered = 0
     local returned = 0
     local preservedImpounds = 0
+    local preservedDurableOperations = 0
     local quarantined = 0
     local processedImpoundRecords = {}
 
@@ -2296,7 +2373,10 @@ local function moveOutVehiclesIntoGarages(returnMissing)
             end
         end
 
-        local quarantineReason = impoundRecordMismatch
+        local durableOperationPreserved = normalizedPlate and isDurableOperationPlateBlocked(normalizedPlate)
+        local quarantineReason = durableOperationPreserved
+            and 'an unresolved contract or fleet journal owns this plate'
+            or impoundRecordMismatch
 
         if #matchingEntities > 1 then
             quarantineReason = quarantineReason or 'multiple live entities match the stored plate/model'
@@ -2323,7 +2403,12 @@ local function moveOutVehiclesIntoGarages(returnMissing)
             end
         end
 
-        if quarantineReason and normalizedPlate then
+        if durableOperationPreserved then
+            preservedDurableOperations = preservedDurableOperations + 1
+            print(('[drs_garages] Preserved plate %s without reconciliation because a contract or fleet journal owns it.'):format(
+                normalizedPlate
+            ))
+        elseif quarantineReason and normalizedPlate then
             vehicleReconciliationQuarantine[normalizedPlate] = quarantineReason
             quarantined = quarantined + 1
             print(('[drs_garages] WARNING: Quarantined plate %s during restart reconciliation: %s. Remove the conflicting entity and restart drs_garages.'):format(
@@ -2399,14 +2484,15 @@ local function moveOutVehiclesIntoGarages(returnMissing)
         end
     end
 
-    print(('[drs_garages] Restart reconciliation kept %s live vehicle(s) active, returned %s missing vehicle(s) to storage, preserved %s impound row(s), and quarantined %s suspicious plate(s).'):format(
+    print(('[drs_garages] Restart reconciliation kept %s live vehicle(s) active, returned %s missing vehicle(s) to storage, preserved %s impound row(s), preserved %s durable-operation row(s), and quarantined %s suspicious plate(s).'):format(
         recovered,
         returned,
         preservedImpounds,
+        preservedDurableOperations,
         quarantined
     ))
 
-    return recovered, returned, preservedImpounds, quarantined
+    return recovered, returned, preservedImpounds, preservedDurableOperations, quarantined
 end
 
 AddEventHandler('onResourceStart', function(resource)
@@ -2435,10 +2521,22 @@ AddEventHandler('onResourceStart', function(resource)
         return
     end
 
+    local guardDeadline = GetGameTimer() + 30000
+    while isDurableOperationPlateBlocked('DRSWAIT') and GetGameTimer() < guardDeadline do
+        Wait(100)
+    end
+    if isDurableOperationPlateBlocked('DRSWAIT') then
+        startupReconciliationComplete = true
+        startupReconciliationSuccessful = false
+        startupReconciliationDetail = 'contract/fleet durable-operation guards did not become ready within 30 seconds'
+        print(('[drs_garages] ERROR: Restart reconciliation failed because %s.'):format(startupReconciliationDetail))
+        return
+    end
+
     activeVehicles = {} -- rebuild the cache from authoritative world/DB state
     vehicleReconciliationQuarantine = {}
 
-    local reconciliationOk, recoveredOrError, returned, preservedImpounds, quarantined = xpcall(function()
+    local reconciliationOk, recoveredOrError, returned, preservedImpounds, preservedDurableOperations, quarantined = xpcall(function()
         return moveOutVehiclesIntoGarages(Config.AutoRespawn == true)
     end, function(errorMessage)
         return debug.traceback(errorMessage, 2)
@@ -2448,10 +2546,11 @@ AddEventHandler('onResourceStart', function(resource)
     startupReconciliationSuccessful = reconciliationOk == true
 
     if reconciliationOk then
-        startupReconciliationDetail = ('reconciled %d live, %d missing, %d preserved impound, and %d quarantined vehicle(s)'):format(
+        startupReconciliationDetail = ('reconciled %d live, %d missing, %d preserved impound, %d preserved durable operation, and %d quarantined vehicle(s)'):format(
             tonumber(recoveredOrError) or 0,
             tonumber(returned) or 0,
             tonumber(preservedImpounds) or 0,
+            tonumber(preservedDurableOperations) or 0,
             tonumber(quarantined) or 0
         )
     else
@@ -2536,7 +2635,9 @@ lib.callback.register('drs_garages:getOwnedVehicles', function(source, index, so
 
         local authorizedVehicles = {}
         for _, vehicle in ipairs(vehicles) do
-            if vehicleMatchesOwnershipMode(vehicle, player, true) then authorizedVehicles[#authorizedVehicles + 1] = vehicle end
+            if vehicleMatchesOwnershipMode(vehicle, player, true) and canAccessJobFleetVehicle(source, vehicle) then
+                authorizedVehicles[#authorizedVehicles + 1] = vehicle
+            end
         end
 
         return BuildDrsGarageClientVehicles(authorizedVehicles)
@@ -2626,7 +2727,7 @@ lib.callback.register('drs_garages:getImpoundedVehicles', function(source, index
             local plate = normalizePlate(vehicle.plate)
             local entity = plate and getActiveVehicleByPlate(plate) or nil
 
-            if not vehicleMatchesOwnershipMode(vehicle, player, true) or not plate
+            if not vehicleMatchesOwnershipMode(vehicle, player, true) or not canAccessJobFleetVehicle(source, vehicle) or not plate
                 or not rowTypeMatchesGarage(vehicle, impound) or not rowHasStorageState(vehicle, 0)
             then
                 -- Invalid/mismatched rows never cross vehicle-type impounds.
@@ -2740,6 +2841,7 @@ lib.callback.register('drs_garages:takeOutVehicle', function(source, index, plat
 
     if not player or not vehicle or normalizePlate(vehicle.plate) ~= plate then return finish() end
     if not rowHasStorageState(vehicle, 1) or not vehicleMatchesOwnershipMode(vehicle, player, society) then return finish() end
+    if society and not canAccessJobFleetVehicle(source, vehicle) then return finish() end
     if not vehicleVisibleAtGarage(vehicle, index, garage, player, society == true) then return finish() end
 
     -- Claim the exact stored row before creating an entity. A resource/process
@@ -2769,6 +2871,7 @@ lib.callback.register('drs_garages:takeOutVehicle', function(source, index, plat
         or normalizePlate(currentVehicle.plate) ~= plate
         or not rowHasStorageState(currentVehicle, 0)
         or not vehicleMatchesOwnershipMode(currentVehicle, player, society)
+        or society and not canAccessJobFleetVehicle(source, currentVehicle)
         or not vehicleVisibleAtGarage(currentVehicle, index, garage, player, society == true)
         or not currentHasStoredModel or not currentModelMatches
         or getActiveVehicleByPlate(plate)
@@ -4750,6 +4853,7 @@ lib.callback.register('drs_garages:retrieveVehicle', function(source, index, pla
     if not player or not vehicle or normalizePlate(vehicle.plate) ~= plate then return finish(false) end
     if not rowHasStorageState(vehicle, 0) or not rowTypeMatchesGarage(vehicle, impound) then return finish(false) end
     if not vehicleMatchesOwnershipMode(vehicle, player, society) then return finish(false) end
+    if society and not canAccessJobFleetVehicle(source, vehicle) then return finish(false) end
 
     local impoundRecord, recordRead = getActiveImpoundRecord(plate)
     if not recordRead then return finish(false, nil, 'database_unavailable') end
@@ -4800,6 +4904,7 @@ lib.callback.register('drs_garages:retrieveVehicle', function(source, index, pla
     if not player or not currentVehicle or not sameVehicleRow or not rowHasStorageState(currentVehicle, 0)
         or not rowTypeMatchesGarage(currentVehicle, impound)
         or not vehicleMatchesOwnershipMode(currentVehicle, player, society)
+        or society and not canAccessJobFleetVehicle(source, currentVehicle)
     then
         return rejectSpawn(entity)
     end
@@ -5178,6 +5283,7 @@ lib.callback.register('drs_garages:getVehicleCoords', function(source, plate, so
 
     if not vehicle or normalizePlate(vehicle.plate) ~= plate or not rowHasStorageState(vehicle, 0) then return end
     if not vehicleMatchesOwnershipMode(vehicle, player, society) then return end
+    if society and not canAccessJobFleetVehicle(source, vehicle) then return end
     if isVehicleStorageInProgress(plate) then return end
 
     local entity = getActiveVehicleByPlate(plate)

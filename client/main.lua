@@ -391,6 +391,25 @@ local function openGarageVehicles(args)
     lib.showContext('garage_vehicles')
 end
 
+local function getFleetManagerAccess(index, garage)
+    local settings = type(Config.JobFleet) == 'table' and Config.JobFleet or {}
+    if settings.Enabled == false or not garage or garage.Property or garage.Jobs == nil then return end
+
+    local called, response = pcall(lib.callback.await, 'drs_garages:fleet:canManage', false, index)
+    if not called or type(response) ~= 'table' then return end
+    if response.ok ~= true and response.needsJob ~= true then return end
+
+    return {
+        job = type(response.job) == 'string' and response.job or nil,
+        admin = response.admin == true,
+        needsJob = response.needsJob == true
+    }
+end
+
+local function openFleetManager(index, access)
+    TriggerEvent('drs_garages:fleet:open', index, access and access.job or nil)
+end
+
 local function openGarageContext(index)
     local garage = getGarage(index)
     if not garage then
@@ -417,6 +436,17 @@ local function openGarageContext(index)
             arrow = true,
             args = { index = index, society = true },
             onSelect = openGarageVehicles
+        }
+    end
+
+    local fleetAccess = getFleetManagerAccess(index, garage)
+    if fleetAccess then
+        options[#options + 1] = {
+            title = locale('fleet_manager'),
+            description = locale('fleet_manager_desc'),
+            icon = 'warehouse',
+            arrow = true,
+            onSelect = function() openFleetManager(index, fleetAccess) end
         }
     end
 
@@ -1389,6 +1419,7 @@ local function buildNuiPayload(action, session, vehicles)
         mode = session.mode,
         activeScope = session.scope,
         scopes = getNuiScopes(session),
+        canManageFleet = session.canManageFleet == true,
         vehicles = vehicles,
         labels = {
             search = locale('garage_ui_search'),
@@ -1423,7 +1454,9 @@ local function buildNuiPayload(action, session, vehicles)
             sortImpoundedDesc = locale('garage_ui_sort_impounded_desc'),
             sortImpoundedAsc = locale('garage_ui_sort_impounded_asc'),
             sortFeeDesc = locale('garage_ui_sort_fee_desc'),
-            sortFeeAsc = locale('garage_ui_sort_fee_asc')
+            sortFeeAsc = locale('garage_ui_sort_fee_asc'),
+            manageFleet = locale('fleet_manager'),
+            fleetMinGrade = locale('fleet_min_grade')
         }
     }
 end
@@ -1501,6 +1534,8 @@ local function queryNuiVehicles(session, scope, revision)
                 engine = clampPercentage(props.engineHealth, 10),
                 body = clampPercentage(props.bodyHealth, 10),
                 classLabel = getVehicleClassLabel(class),
+                fleetManaged = vehicle.fleet_managed == true,
+                fleetMinGrade = vehicle.fleet_managed == true and math.max(0, math.floor(tonumber(vehicle.fleet_min_grade) or 0)) or nil,
                 imageCandidates = buildVehicleImageCandidates(modelName, settings, shopResource, presentation),
                 actionLabel = actionLabel,
                 actionKind = actionKind,
@@ -1548,6 +1583,7 @@ local function openGarageNui(mode, index, location)
 
     nuiSessionGeneration += 1
     local generation = nuiSessionGeneration
+    local fleetAccess = mode == 'garage' and getFleetManagerAccess(index, location) or nil
     local session = {
         id = ('drs-%s-%s'):format(generation, GetGameTimer()),
         generation = generation,
@@ -1557,6 +1593,8 @@ local function openGarageNui(mode, index, location)
         index = index,
         location = location,
         allowSociety = mode == 'impound' or not location.Property,
+        canManageFleet = fleetAccess ~= nil,
+        fleetJob = fleetAccess and fleetAccess.job or nil,
         scope = 'personal',
         busy = true,
         items = {}
@@ -1834,6 +1872,31 @@ RegisterNUICallback('scope', function(data, cb)
         session.busy = false
         SendNUIMessage(buildNuiPayload('update', session, vehicles))
         sendNuiBusy(session, false)
+    end)
+end)
+
+RegisterNUICallback('fleet', function(data, cb)
+    local session = nuiSession
+    local sessionId = type(data) == 'table' and data.sessionId or nil
+
+    if session and GetGameTimer() >= session.expiresAt then
+        closeGarageNui()
+        session = nil
+    end
+
+    if not session or sessionId ~= session.id or session.busy or session.mode ~= 'garage'
+        or session.scope ~= 'society' or session.canManageFleet ~= true
+    then
+        cb({ ok = false })
+        return
+    end
+
+    session.busy = true
+    cb({ ok = true })
+    closeGarageNui()
+
+    CreateThread(function()
+        openFleetManager(session.index, { job = session.fleetJob })
     end)
 end)
 

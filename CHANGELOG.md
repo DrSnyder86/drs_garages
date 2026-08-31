@@ -1,5 +1,35 @@
 # Changelog
 
+## 2.6.0-drs.1 — 2026-08-29
+
+### Contract V2
+
+- Split player sales, boss society donations, and society withdrawals into
+  independent policies; only boss donations are enabled by default.
+- Added eligibility-aware/cancellable signing plus exact server revalidation.
+- Added a durable transfer journal, restart reconciliation, ambiguous-plate
+  quarantine, administrator inspection/resolution commands, and item setup docs.
+
+### Job fleets
+
+- Added boss/admin Fleet Manager for personal donations, stable garage
+  assignments, minimum-grade access, moves, audited retirement, and separate
+  ACE-admin issuance from a server model allowlist.
+- Enforced managed fleet grade/garage policy across listing, takeout, impound
+  recovery, and location; legacy job rows remain compatible until adopted.
+- Added fleet metadata/audit tables, idempotent external creation, restart
+  reconciliation, plate quarantine, and administrator recovery commands.
+
+### Society purchasing and interface
+
+- Added a protected `drs_vehicleshop` bridge for Qbox boss purchases using
+  society banking, independent shop/fleet recovery journals, and fail-closed
+  payment/creation handoff semantics.
+- Added **Manage fleet** to the Society tab/context fallback and minimum-grade
+  badges to managed vehicle cards.
+- Expanded the doctor with contract item/journal, fleet service, purchase bridge,
+  free-issuance policy, and unresolved-operation reporting.
+
 ## 2.5.0-drs.1 — 2026-08-26
 
 ### Garage interaction quality of life

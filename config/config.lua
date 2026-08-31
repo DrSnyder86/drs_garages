@@ -285,14 +285,15 @@ Config.Garages = {
     },
     -- mrpd garage
     {
+        Garage = 'mrpd_fleet',
+        Label = 'MRPD Fleet Garage',
         Visible = false,
         Type = 'car',
         Position = vector3(442.54, -974.89, 25.7),
         PedPosition = vector4(442.54, -974.89, 25.7, 178.7),
         Model = `s_m_m_armoured_01`,
         SpawnPosition = vector4(450.43, -975.7, 25.7, 95.01),
-        Jobs = { 'police', 'leo' },
-        -- Jobs = 'police',
+        Jobs = { 'police' },
         Interior = 'large',
     },
     -- sahp lsf
@@ -678,15 +679,79 @@ Config.Impounds = {
     },
 }
 
+-- Bosses can adopt personally owned vehicles into their current job fleet and
+-- manage the assigned garage/minimum grade. ACE administrators can additionally
+-- issue allowlisted vehicles without charging a society account. Paid boss
+-- purchases remain a separate drs_vehicleshop operation so the catalog, price,
+-- society debit, and recovery journal stay server-authoritative.
+Config.JobFleet = {
+    Enabled = true,
+    AcePermission = 'drs_garages.fleet.admin',
+    CommandEnabled = true,
+    Command = 'jobfleet',
+    Distance = 10.0,
+    VehicleDistance = 8.0,
+    RequireGarageProximity = true,
+    AdminBypassesProximity = false,
+    ExternalIssuanceRequiresGarageProximity = true,
+    BossMinimumGrade = 0,
+    RequireBossDuty = true,
+    BossCanCreate = false, -- Free issuance is intentionally ACE-admin-only.
+    AdminCanUseVehicles = false,
+    CreationEnabled = true,
+    BossPurchasesEnabled = true,
+    VehicleShopResource = 'drs_vehicleshop',
+    PurchaseSessionDuration = 300000,
+    MaximumVehicleGrade = 100,
+    MaximumReasonLength = 500,
+    TrustedResources = {
+        drs_vehicleshop = true
+    },
+
+    -- Every issued or purchased model must exist both here and in the active
+    -- framework vehicle catalog. Paid purchases must also exist in the matching
+    -- drs_vehicleshop fleet catalog, so neither client can invent a model/price.
+    AllowedModels = {
+        police = {
+            pbus = true,
+            police = true,
+            police2 = true,
+            police3 = true,
+            police4 = true,
+            policeb = true,
+            policet = true,
+            pranger = true,
+            riot = true,
+            sheriff = true,
+            sheriff2 = true
+        },
+        ambulance = {
+            ambulance = true,
+            firetruk = true,
+            lguard = true
+        }
+    }
+}
+
 Config.Contract = {
-    -- Opt-in: framework money, inventory, and ownership APIs do not provide one
-    -- atomic transaction. A process crash during a transfer can require manual
-    -- reconciliation even though normal runtime failures are compensated.
-    Enabled = false,
-    Duration = 5000, -- The animation duration
-    Item = 'contract', -- The item name
-    VehicleDistance = 5.0, -- Maximum vehicle distance for a server-authorized contract (plus the 2m network tolerance).
+    -- Contract V2 keeps each ownership path independently controllable. Society
+    -- donations are the conservative default; sales and privatizing a fleet
+    -- vehicle remain explicit opt-ins.
+    Enabled = true,
+    Actions = {
+        PlayerSales = false,
+        SocietyDonations = true,
+        SocietyWithdrawals = false
+    },
+    Duration = 5000, -- Cancellable signing duration before the server commits anything.
+    Item = 'contract', -- Must also exist in your inventory resource; see install/ContractItem.md.
+    VehicleDistance = 5.0, -- Server-authorized vehicle distance (plus the 2m network tolerance).
+    PlayerDistance = 10.0, -- Maximum seller/buyer distance; the client displays only nearby players.
     MinimumPrice = 0,
     MaximumPrice = 100000000,
-    SocietyWithdrawalRequiresBoss = true -- Only the current job boss can privatize a society vehicle.
+    PaymentAccount = 'money', -- `money` maps to cash on QB/Qbox; `bank` is also supported.
+    SocietyDonationPermission = 'boss', -- member, boss, admin, boss_or_admin
+    SocietyWithdrawalPermission = 'admin', -- Safe default; privatizing a fleet vehicle requires this policy.
+    AdminAce = 'drs_garages.contract.admin',
+    JournalRetentionDays = 90
 }

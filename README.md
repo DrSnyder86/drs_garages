@@ -1,7 +1,7 @@
 # DRS Garages
 
 `drs_garages` is the DRS-maintained garage resource based on Lunar Scripts'
-`lunar_garage` 2.0.3. Version `2.5.0-drs.1` supports Qbox, QB-Core, and ESX,
+`lunar_garage` 2.0.3. Version `2.6.0-drs.1` supports Qbox, QB-Core, and ESX,
 with automatic schema validation, safe QB/Qbox compatibility migrations,
 configurable vehicle-storage behavior, stock QB housing discovery, and the DRS
 builds of `qbx_properties` and `drs_vehicleshop`.
@@ -9,6 +9,19 @@ builds of `qbx_properties` and `drs_vehicleshop`.
 The folder and runtime resource name must be exactly `drs_garages`. Its events
 and callbacks use the `drs_garages:*` namespace, and companion resources call
 its API through `exports.drs_garages`.
+
+## What changed in 2.6
+
+- Contract V2 separates player sales, society donations, and society
+  withdrawals; ships with only boss donations enabled; and journals every
+  multi-step transfer for restart recovery and administrator review.
+- Bosses can adopt personal vehicles into a job fleet, assign a garage and
+  minimum grade, move or retire stored assets, and open Fleet Manager directly
+  from the Society tab. ACE administrators can issue allowlisted vehicles.
+- Qbox bosses can purchase allowlisted fleet vehicles from the current
+  `drs_vehicleshop` catalog with society funds. Both resources keep independent
+  idempotency/recovery journals, and uncertain payment or creation results stop
+  for review instead of being replayed blindly.
 
 ## What changed in 2.5
 
@@ -72,6 +85,8 @@ See [CHANGELOG.md](CHANGELOG.md) for the release summary and
 - `oxmysql`
 - `ox_lib`
 - exactly one supported core: `qbx_core`, `qb-core`, or `es_extended`
+- Qbox fleet issuance requires `qbx_vehicles`; paid society fleet purchases also
+  require the current `drs_vehicleshop` and a configured society banking provider
 - optionally `ox_target`, `qb-target`, or `qtarget`; TextUI is used when no
   supported target is available
 - optionally `qbx_radialmenu` or `qb-radialmenu`; ox_lib provides the automatic
@@ -108,6 +123,12 @@ ensure qbx_vehicles
 ensure qbx_vehiclekeys
 ensure ox_inventory
 ensure ox_target
+
+# Required only for paid society fleet purchases (choose the provider you use):
+# Pure Qbox commonly uses Renewed-Banking; Doctor reports its async persistence limitation.
+ensure Renewed-Banking
+# qb-banking is preferred when your framework stack supports it because mutations are awaited.
+# ensure qb-banking
 
 # Only when selected qbx_properties interiors require it:
 ensure bob74_ipl
@@ -256,6 +277,21 @@ The framework vehicle table and `drs_vehicle_impounds` must both use InnoDB.
 Startup rejects nontransactional storage engines because vehicle state and DRS
 impound metadata are committed together.
 
+### Contract and job-fleet journals
+
+With automatic migration enabled, DRS also creates and exactly validates:
+
+- `drs_vehicle_contract_operations`, the Contract V2 recovery ledger;
+- `drs_job_fleet_vehicles`, the policy metadata for managed society assets; and
+- `drs_job_fleet_operations`, the durable fleet mutation/idempotency journal.
+
+With automatic migration disabled, import
+[`sql/drs_vehicle_contract_operations.sql`](sql/drs_vehicle_contract_operations.sql)
+and [`sql/drs_job_fleet.sql`](sql/drs_job_fleet.sql) before starting DRS. These
+tables never replace the framework vehicle table. An incompatible existing
+journal is not dropped or rewritten automatically; preserve its audit rows and
+follow the reported repair instructions.
+
 The optional [`sql/repair_qbox_vehicle_storage_state.sql`](sql/repair_qbox_vehicle_storage_state.sql)
 repair changes existing vehicle state and is never run automatically. Review it
 and take a backup before using it. It is an offline repair: stop the FiveM
@@ -282,7 +318,8 @@ console and the administrator's F8 console. It reports PASS, WARN, or FAIL for
 the resource name/version, dependencies, OneSync, framework ambiguity,
 database readiness, target/radial and vehicle-key resources, known conflicts,
 companions, configured locations, parking behavior, storage mode, garage IDs,
-and runtime state.
+runtime state, contract registration/journal health, and fleet service/purchase
+health.
 
 Treat every FAIL as a deployment blocker. Review WARN entries to confirm they
 are intentional.
@@ -464,29 +501,71 @@ vehicle properties, ownership scope, garage identity, and the actual action are
 resolved from the current Lua session and revalidated by the existing server
 callbacks.
 
-## Vehicle contract safeguards
+## Vehicle Contract V2
 
-Vehicle contracts are disabled by default in this release. Set
-`Config.Contract.Enabled = true` only after accepting that framework money,
-inventory, and ownership APIs cannot be committed as one durable transaction;
-a server/process crash during a transfer can still require administrator
-reconciliation. Normal runtime failures are validated and compensated, but
-that cannot guarantee crash-time exactly-once behavior.
+The master contract feature is enabled, but its three actions are independent.
+The supplied safe policy enables only boss-authorized personal-to-society
+donations. Player sales and society-to-personal withdrawals remain disabled.
+The withdrawal policy is `admin`, so enabling that action still requires
+`drs_garages.contract.admin`.
 
-Paid recovery supports DRS per-vehicle fees, legacy QB/Qbox `depotprice`, and
-the `Config.ImpoundPrice` fallback. Runtime rollback/refund checks cover normal
-failures, but a process crash between the framework cash debit and database
-state commit can still require a manual refund.
+Add the configured `contract` item to the active inventory by following
+[`install/ContractItem.md`](install/ContractItem.md). DRS cannot safely edit an
+external inventory catalog automatically. Contract signing is cancellable and
+does not consume the item or mutate ownership until the server has revalidated
+the item, players, job/boss policy, exact nearby vehicle row, routing bucket,
+price, and operation locks.
 
-`Config.Contract.VehicleDistance` defaults to `5.0` metres. Contract actions
-must reference the active vehicle near the player in the same routing bucket;
-server validation adds the standard `2.0`-metre network tolerance, making the
-default effective upper bound `7.0` metres.
+Every transfer is recorded in `drs_vehicle_contract_operations`. Startup
+reconciles provable outcomes and quarantines ambiguous plates. Inspect and
+resolve only after checking inventory, money, ownership, and keys:
 
-`Config.Contract.SocietyWithdrawalRequiresBoss` defaults to `true`. Only a
-player whose current matching job is marked as a boss can use a contract to
-privatize a society vehicle. Set it to `false` only when every member of the
-matching job should have that authority.
+```text
+drsgarages:contracts
+drsgarages:contractresolve <operation_id> <completed|compensated|cancelled>
+```
+
+`Config.Contract.VehicleDistance` defaults to `5.0` metres and
+`PlayerDistance` to `10.0`. `PaymentAccount` accepts `money` (cash on QB/Qbox)
+or `bank`. Stock QB `qb-vehiclekeys` cannot safely reset global/offline plate
+keys, so DRS blocks contract registration on that unsupported combination.
+
+## Job Fleet Manager
+
+Any static public garage with an exact `Jobs` allowlist can host a managed job
+fleet. Give it a stable `Garage` ID; the supplied MRPD example uses
+`mrpd_fleet`. At that garage an authorized boss can use the Society tab's
+**Manage fleet** button or `/jobfleet` to:
+
+- permanently donate one of their personal stored/nearby out vehicles;
+- move a stored managed asset between compatible garages for the same job;
+- set the minimum job grade required to list, locate, recover, or take it out;
+- retire a stored asset with plate confirmation and an audit reason; and
+- on Qbox, purchase from `drs_vehicleshop` with society funds.
+
+ACE administrators can manage another configured job and use the separate free
+issuance action. Boss free issuance is disabled by default so it cannot bypass
+society purchasing. Models must exist in both the framework catalog and
+`Config.JobFleet.AllowedModels`; paid models must also be allowed by the shop's
+`Config.Fleet.Catalogs`. Managed assets always honor their assigned garage even
+when `Config.Storage.Mode = 'global'`; untouched legacy job rows retain the
+legacy global behavior until adopted.
+
+Add these administrator permissions:
+
+```cfg
+add_ace group.admin drs_garages.contract.admin allow
+add_ace group.admin drs_garages.fleet.admin allow
+```
+
+Fleet mutations are recorded in `drs_job_fleet_operations`. Attention rows
+keep their plates quarantined until an administrator verifies the framework row
+and journal, then deliberately resolves them:
+
+```text
+drsgarages:fleetops [plate]
+drsgarages:fleetresolve <operationId> <committed|failed> <reason>
+```
 
 ## Property and housing integrations
 
@@ -538,6 +617,26 @@ Server-created vehicle tracking, used by `drs_vehicleshop` delivery:
 exports.drs_garages:RegisterActiveVehicle(source, plate, netId)
 exports.drs_garages:UnregisterActiveVehicle(plate, netId)
 ```
+
+Trusted server-side fleet issuance (normally called only by
+`drs_vehicleshop`):
+
+```lua
+local result = exports.drs_garages:CreateJobFleetVehicle({
+    requestId = 'stable-id-from-caller',
+    actorSource = source,
+    action = 'society_purchase', -- or admin_grant from an allowed resource
+    job = 'police',
+    model = 'police3',
+    garageIndex = configuredGarageIndex,
+    minGrade = 0,
+    reason = 'Optional audit note'
+})
+```
+
+The invoking resource must be in `Config.JobFleet.TrustedResources`; the
+connected actor, exact boss/admin permission, garage/job/model allowlists,
+request fingerprint, and final database row are all revalidated server-side.
 
 Server-side enforcement impound integration:
 
@@ -593,7 +692,13 @@ before scheduling either removal.
    garage, DRS, or MDT record; confirm a mission/script vehicle is rejected.
 10. Test a property as owner, keyholder, and unauthorized player.
 11. Buy one vehicle through `drs_vehicleshop` and confirm its configured garage,
-   keys, storage state, and restart persistence.
+    keys, storage state, and restart persistence.
+12. As a job boss at MRPD, donate a personal vehicle, set a grade restriction,
+    verify a lower grade cannot see/use it, move it, then retire a disposable
+    test asset. As an ACE admin, test one free allowlisted issuance.
+13. With society banking funded, purchase one police vehicle through Fleet
+    Manager and confirm exactly one debit, one shop order, one fleet operation,
+    and one stored job vehicle. Test the contract item donation path separately.
 
 ## Attribution and license
 

@@ -1,6 +1,6 @@
 local RESOURCE_NAME = GetCurrentResourceName()
 local EXPECTED_RESOURCE_NAME = 'drs_garages'
-local EXPECTED_VERSION = '2.5.0-drs.1'
+local EXPECTED_VERSION = '2.6.0-drs.1'
 local COMMAND_NAME = 'drsgarages:doctor'
 
 local CORE_RESOURCES = {
@@ -646,6 +646,304 @@ local function checkEnforcementImpound(report)
     return true
 end
 
+local function configuredContractActions(settings)
+    local actions = type(settings.Actions) == 'table' and settings.Actions or nil
+    if not actions then return { 'player sales', 'society donations', 'society withdrawals' } end
+
+    local enabledActions = {}
+    if actions.PlayerSales == true then enabledActions[#enabledActions + 1] = 'player sales' end
+    if actions.SocietyDonations == true then enabledActions[#enabledActions + 1] = 'society donations' end
+    if actions.SocietyWithdrawals == true then enabledActions[#enabledActions + 1] = 'society withdrawals' end
+    return enabledActions
+end
+
+local function inventoryItemExists(item, frameworkName)
+    if isStarted('ox_inventory') then
+        local ok, result = pcall(function() return exports.ox_inventory:Items() end)
+        if not ok or type(result) ~= 'table' then return nil, 'ox_inventory item catalog could not be queried' end
+        if type(result[item]) == 'table' then return true, 'ox_inventory' end
+        return false, 'ox_inventory'
+    end
+
+    if frameworkName == 'qb-core' then
+        local ok, core = pcall(function() return exports['qb-core']:GetCoreObject() end)
+        if ok and core and core.Shared and type(core.Shared.Items) == 'table' then
+            return type(core.Shared.Items[item]) == 'table', 'QB shared item catalog'
+        end
+    elseif frameworkName == 'es_extended' and Framework and type(Framework.getItemLabel) == 'function' then
+        local ok, label = pcall(Framework.getItemLabel, item)
+        if ok and type(label) == 'string' and label ~= '' then return true, 'ESX item catalog' end
+    end
+
+    return nil, 'the active inventory catalog cannot be inspected automatically'
+end
+
+local function checkContracts(report, frameworkName)
+    local settings = type(Config) == 'table' and type(Config.Contract) == 'table' and Config.Contract or {}
+    local actions = configuredContractActions(settings)
+    local active = settings.Enabled == true and #actions > 0
+
+    local journal = rawget(_G, 'DRSGaragesContractJournal')
+    local status
+    local statusError
+    if type(journal) == 'table' and type(journal.getStatus) == 'function' then
+        local ok, result = pcall(journal.getStatus)
+        if ok and type(result) == 'table' then
+            status = result
+        else
+            statusError = ok and 'status provider returned an invalid result' or tostring(result)
+        end
+    else
+        statusError = 'status provider is unavailable'
+    end
+
+    if not active then
+        local disabledDetail = settings.Enabled == true and 'master enabled, but every Contract V2 action is disabled'
+            or 'disabled'
+
+        if not status then
+            add(report, 'WARN', 'Vehicle contracts', ('%s; existing journal state could not be verified: %s'):format(
+                disabledDetail,
+                statusError or 'unknown status error'
+            ))
+        elseif status.tablePresent ~= true then
+            add(report, 'PASS', 'Vehicle contracts', disabledDetail .. '; no existing journal requires reconciliation')
+        elseif status.attempted ~= true or status.ready ~= true or status.statusQueryOk ~= true then
+            add(report, 'WARN', 'Vehicle contracts', ('%s; existing journal reconciliation is unavailable: %s'):format(
+                disabledDetail,
+                status.statusQueryDetail or status.detail or 'unknown journal error'
+            ))
+        else
+            local reviewRequired = tonumber(status.reviewRequired) or 0
+            local pendingQuarantine = tonumber(status.pendingQuarantine) or 0
+            local inProgress = tonumber(status.inProgress) or 0
+            if reviewRequired > 0 or pendingQuarantine > 0 or inProgress > 0 then
+                add(report, 'WARN', 'Vehicle contracts', ('%s; existing journal has %d in progress, %d requiring review, and %d pending quarantine; run drsgarages:contracts'):format(
+                    disabledDetail,
+                    inProgress,
+                    reviewRequired,
+                    pendingQuarantine
+                ))
+            else
+                add(report, 'PASS', 'Vehicle contracts', ('%s; existing journal reconciled cleanly (%d recovered)'):format(
+                    disabledDetail,
+                    tonumber(status.recovered) or 0
+                ))
+            end
+        end
+        return
+    end
+
+    local paymentAccount = normalizedText(settings.PaymentAccount) or 'money'
+    local paymentValid = paymentAccount == 'money' or paymentAccount == 'bank'
+    local allowedPolicies = { member = true, boss = true, admin = true, boss_or_admin = true }
+    local actionSettings = type(settings.Actions) == 'table' and settings.Actions or nil
+    local donationEnabled = not actionSettings or actionSettings.SocietyDonations == true
+    local withdrawalEnabled = not actionSettings or actionSettings.SocietyWithdrawals == true
+    local donationPolicy = normalizedText(settings.SocietyDonationPermission) or 'boss'
+    local withdrawalPolicy = normalizedText(settings.SocietyWithdrawalPermission)
+    local donationPolicyValid = not donationEnabled or allowedPolicies[donationPolicy] == true
+    local withdrawalPolicyValid = not withdrawalEnabled or withdrawalPolicy ~= nil and allowedPolicies[withdrawalPolicy] == true
+    local policyValid = paymentValid and donationPolicyValid and withdrawalPolicyValid
+    local policyProblems = {}
+    if not paymentValid then
+        policyProblems[#policyProblems + 1] = ('unsupported PaymentAccount `%s` (use money or bank)'):format(tostring(settings.PaymentAccount))
+    end
+    if not donationPolicyValid then
+        policyProblems[#policyProblems + 1] = ('invalid SocietyDonationPermission `%s`'):format(tostring(settings.SocietyDonationPermission))
+    end
+    if not withdrawalPolicyValid then
+        policyProblems[#policyProblems + 1] = 'SocietyWithdrawalPermission must explicitly be member, boss, admin, or boss_or_admin'
+    end
+
+    add(
+        report,
+        policyValid and 'PASS' or 'FAIL',
+        'Vehicle contracts',
+        policyValid and ('enabled: %s; payment account %s'):format(join(actions), paymentAccount)
+            or join(policyProblems)
+    )
+
+    if not status then
+        add(report, 'FAIL', 'Contract journal', statusError or 'status provider is unavailable')
+    elseif status.attempted ~= true then
+        add(report, 'FAIL', 'Contract journal', 'journal initialization was not attempted')
+    elseif status.ready ~= true then
+        add(report, 'FAIL', 'Contract journal', status.detail or 'journal initialization did not complete')
+    elseif status.statusQueryOk ~= true then
+        add(report, 'FAIL', 'Contract journal', status.statusQueryDetail or 'journal status query failed')
+    else
+        local reviewRequired = tonumber(status.reviewRequired) or 0
+        local pendingQuarantine = tonumber(status.pendingQuarantine) or 0
+        local inProgress = tonumber(status.inProgress) or 0
+        if reviewRequired > 0 or pendingQuarantine > 0 then
+            add(report, 'WARN', 'Contract journal', ('%d in progress, %d requiring review, %d pending quarantine; run drsgarages:contracts and resolve verified rows with drsgarages:contractresolve'):format(
+                inProgress,
+                reviewRequired,
+                pendingQuarantine
+            ))
+        elseif inProgress > 0 then
+            add(report, 'WARN', 'Contract journal', ('%d operation(s) are currently in progress; run drsgarages:contracts if they do not finish'):format(inProgress))
+        else
+            add(report, 'PASS', 'Contract journal', ('ready; %d startup operation(s) reconciled; no unresolved operations'):format(
+                tonumber(status.recovered) or 0
+            ))
+        end
+    end
+
+    if not status or status.registrationAttempted ~= true then
+        add(report, 'FAIL', 'Contract registration', 'usable-item registration was not attempted')
+    elseif status.registrationReady ~= true then
+        add(report, 'FAIL', 'Contract registration', status.registrationDetail or 'usable-item registration is unavailable')
+    else
+        add(report, 'PASS', 'Contract registration', status.registrationDetail or 'usable item registered')
+    end
+
+    local item = type(settings.Item) == 'string' and settings.Item:match('^%s*(.-)%s*$') or nil
+    if not item or item == '' then
+        add(report, 'FAIL', 'Contract item', 'Config.Contract.Item is empty or invalid')
+    else
+        local exists, provider = inventoryItemExists(item, frameworkName)
+        if exists == true then
+            add(report, 'PASS', 'Contract item', ('`%s` exists in %s'):format(item, provider))
+        elseif exists == false then
+            add(report, 'WARN', 'Contract item', ('`%s` is missing from %s; follow install/ContractItem.md'):format(item, provider))
+        else
+            add(report, 'WARN', 'Contract item', ('`%s` configured, but %s; verify install/ContractItem.md'):format(item, provider))
+        end
+    end
+
+    if frameworkName == 'qb-core' and Config.UseKeySystem ~= false
+        and GetResourceState('qb-vehiclekeys') ~= 'missing'
+    then
+        add(report, 'FAIL', 'Contract key compatibility', 'stock qb-vehiclekeys cannot safely reset offline/global plate keys; contract registration is blocked')
+    else
+        add(report, 'PASS', 'Contract key compatibility', frameworkName or 'active framework')
+    end
+end
+
+local function countFleetModels(allowedModels)
+    local count = 0
+    for _, models in pairs(type(allowedModels) == 'table' and allowedModels or {}) do
+        if type(models) == 'table' then
+            for _, value in pairs(models) do
+                if value ~= false then count = count + 1 end
+            end
+        end
+    end
+    return count
+end
+
+local function countJobGarages()
+    local count = 0
+    for _, garage in pairs(type(Config.Garages) == 'table' and Config.Garages or {}) do
+        if type(garage) == 'table' and not garage.Property and garage.Jobs ~= nil then count = count + 1 end
+    end
+    return count
+end
+
+local function checkJobFleet(report)
+    local settings = type(Config) == 'table' and type(Config.JobFleet) == 'table' and Config.JobFleet or {}
+    if settings.Enabled == false then
+        add(report, 'PASS', 'Job fleet manager', 'disabled')
+        return
+    end
+
+    local garageCount = countJobGarages()
+    local modelCount = countFleetModels(settings.AllowedModels)
+    local ace = normalizedText(settings.AcePermission)
+    local configurationOk = garageCount > 0 and modelCount > 0 and ace ~= nil
+    add(
+        report,
+        configurationOk and 'PASS' or 'FAIL',
+        'Job fleet configuration',
+        configurationOk and ('%d job garage(s), %d allowlisted model(s), ACE `%s`'):format(
+            garageCount,
+            modelCount,
+            settings.AcePermission
+        ) or 'configure at least one Jobs garage, one AllowedModels entry, and AcePermission'
+    )
+
+    local provider = rawget(_G, 'GetDrsFleetDiagnosticSnapshot')
+    local snapshot
+    if type(provider) == 'function' then
+        local ok, result = pcall(provider)
+        if ok and type(result) == 'table' then snapshot = result end
+    end
+
+    if not snapshot then
+        add(report, 'FAIL', 'Job fleet service', 'diagnostic provider is unavailable')
+    elseif snapshot.ready ~= true then
+        add(report, 'FAIL', 'Job fleet service', snapshot.detail or 'fleet database setup did not complete')
+    elseif snapshot.statusQueryOk ~= true then
+        add(report, 'FAIL', 'Job fleet service', snapshot.statusQueryDetail or 'fleet operation status could not be inspected')
+    elseif (tonumber(snapshot.unresolvedOperations) or 0) > 0 then
+        add(report, 'WARN', 'Job fleet service', ('%d active, %d retired, %d unresolved operation(s); run drsgarages:fleetops'):format(
+            tonumber(snapshot.activeVehicles) or 0,
+            tonumber(snapshot.retiredVehicles) or 0,
+            tonumber(snapshot.unresolvedOperations) or 0
+        ))
+    else
+        add(report, 'PASS', 'Job fleet service', ('%d active, %d retired, no unresolved operations'):format(
+            tonumber(snapshot.activeVehicles) or 0,
+            tonumber(snapshot.retiredVehicles) or 0
+        ))
+    end
+
+    if settings.BossPurchasesEnabled == false then
+        add(report, 'PASS', 'Society fleet purchases', 'disabled')
+    else
+        local resource = normalizedText(settings.VehicleShopResource) or 'drs_vehicleshop'
+        if not isStarted(resource) then
+            add(report, 'WARN', 'Society fleet purchases', ('%s is not started; donation/admin fleet actions remain available'):format(resource))
+        else
+            local ok, shopStatus = pcall(function()
+                return exports[resource]:GetFleetServiceStatus()
+            end)
+            if ok and type(shopStatus) == 'table' and shopStatus.ready == true and shopStatus.ok == true then
+                local reviewOrders = tonumber(shopStatus.reviewOrders) or 0
+                local unresolvedOrders = tonumber(shopStatus.unresolvedOrders) or 0
+                if reviewOrders > 0 then
+                    add(report, 'WARN', 'Society fleet purchases', ('%s ready using %s, but %d order(s) require staff review (%d unresolved total); inspect `drs_vehicle_shop_fleet_orders`'):format(
+                        resource,
+                        normalizedText(shopStatus.bankProvider) or 'the configured society bank',
+                        reviewOrders,
+                        unresolvedOrders
+                    ))
+                elseif shopStatus.bankMutationDurable ~= true then
+                    add(report, 'WARN', 'Society fleet purchases', ('%s ready using %s, but provider persistence is best-effort: %s'):format(
+                        resource,
+                        normalizedText(shopStatus.bankProvider) or 'the configured society bank',
+                        tostring(shopStatus.bankDurabilityDetail or 'the provider does not durably acknowledge balance mutations')
+                    ))
+                else
+                    add(report, 'PASS', 'Society fleet purchases', ('%s ready using %s; %d unresolved order(s), none requiring review'):format(
+                        resource,
+                        normalizedText(shopStatus.bankProvider) or 'the configured society bank',
+                        unresolvedOrders
+                    ))
+                end
+            else
+                local detail = ok and type(shopStatus) == 'table'
+                    and (shopStatus.message or shopStatus.detail or shopStatus.code)
+                    or 'the shop health export is unavailable'
+                add(report, 'WARN', 'Society fleet purchases', ('%s paid checkout is unavailable: %s; donation/admin fleet actions remain available'):format(
+                    resource,
+                    tostring(detail)
+                ))
+            end
+        end
+    end
+
+    add(
+        report,
+        settings.BossCanCreate == true and 'WARN' or 'PASS',
+        'Free fleet issuance',
+        settings.BossCanCreate == true and 'boss issuance is enabled; paid society purchasing can be bypassed'
+            or 'ACE administrators only'
+    )
+end
+
 local function checkConfiguration(report, snapshot)
     if type(Config) ~= 'table' then
         add(report, 'FAIL', 'Configuration', 'Config was not loaded.')
@@ -684,14 +982,6 @@ local function checkConfiguration(report, snapshot)
                 parkingTargetDistance
             )
             or 'ProgressDuration must be 0-60000, MaximumSpeed must be non-negative, and TargetDistance must be 0.5-20.0.'
-    )
-
-    local contractEnabled = type(Config.Contract) == 'table' and Config.Contract.Enabled == true
-    add(
-        report,
-        contractEnabled and 'WARN' or 'PASS',
-        'Vehicle contracts',
-        contractEnabled and 'enabled (framework effects are not one crash-durable transaction)' or 'disabled (safe default)'
     )
 
     local enforcementEnabled = checkEnforcementImpound(report)
@@ -783,6 +1073,8 @@ local function runDoctor()
     checkConflictsAndCompanions(report, frameworkName)
     local snapshot = getDiagnosticSnapshot(report)
     checkConfiguration(report, snapshot)
+    checkContracts(report, frameworkName)
+    checkJobFleet(report)
 
     return report
 end

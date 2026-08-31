@@ -402,3 +402,91 @@ CREATE TABLE IF NOT EXISTS `drs_vehicle_impounds` (
     PRIMARY KEY (`impound_id`),
     UNIQUE KEY `ux_drs_vehicle_impounds_plate` (`plate`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Contract V2 restart-recovery journal. This table is DRS-owned and does not
+-- replace or cascade into player_vehicles.
+CREATE TABLE IF NOT EXISTS `drs_vehicle_contract_operations` (
+    `operation_id` VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    `operation_type` VARCHAR(32) NOT NULL,
+    `status` VARCHAR(32) NOT NULL,
+    `step` VARCHAR(48) NOT NULL,
+    `active_plate` VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    `plate` VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    `vehicle_row_id` VARCHAR(64) NULL,
+    `actor_identifier` VARCHAR(80) NOT NULL,
+    `counterparty_identifier` VARCHAR(80) NULL,
+    `job` VARCHAR(50) NULL,
+    `price` INT UNSIGNED NOT NULL DEFAULT 0,
+    `payment_account` VARCHAR(32) NOT NULL DEFAULT 'money',
+    `item_name` VARCHAR(64) NOT NULL,
+    `item_removed` TINYINT(1) NOT NULL DEFAULT 0,
+    `money_debited` TINYINT(1) NOT NULL DEFAULT 0,
+    `ownership_changed` TINYINT(1) NOT NULL DEFAULT 0,
+    `money_credited` TINYINT(1) NOT NULL DEFAULT 0,
+    `keys_updated` TINYINT(1) NOT NULL DEFAULT 0,
+    `compensated` TINYINT(1) NOT NULL DEFAULT 0,
+    `failure_text` VARCHAR(1000) NULL,
+    `created_at` BIGINT UNSIGNED NOT NULL,
+    `updated_at` BIGINT UNSIGNED NOT NULL,
+    `completed_at` BIGINT UNSIGNED NULL,
+    PRIMARY KEY (`operation_id`),
+    UNIQUE KEY `ux_drs_vehicle_contract_active_plate` (`active_plate`),
+    KEY `idx_drs_vehicle_contract_status_updated` (`status`, `updated_at`),
+    KEY `idx_drs_vehicle_contract_plate_created` (`plate`, `created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Managed job-fleet policy metadata and its durable mutation/idempotency
+-- journal. Framework vehicle ownership remains in player_vehicles.
+CREATE TABLE IF NOT EXISTS `drs_job_fleet_vehicles` (
+    `vehicle_row_id` VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    `plate` VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    `job` VARCHAR(50) NOT NULL,
+    `model` VARCHAR(64) NOT NULL,
+    `vehicle_type` VARCHAR(20) NOT NULL,
+    `garage` VARCHAR(50) NOT NULL,
+    `min_grade` INT UNSIGNED NOT NULL DEFAULT 0,
+    `status` VARCHAR(16) NOT NULL DEFAULT 'active',
+    `added_by_identifier` VARCHAR(80) NOT NULL,
+    `added_by_name` VARCHAR(100) NOT NULL,
+    `added_at` BIGINT UNSIGNED NOT NULL,
+    `updated_at` BIGINT UNSIGNED NOT NULL,
+    `retired_at` BIGINT UNSIGNED NULL,
+    `retire_reason` VARCHAR(500) NULL,
+    PRIMARY KEY (`vehicle_row_id`),
+    UNIQUE KEY `ux_drs_job_fleet_plate` (`plate`),
+    KEY `idx_drs_job_fleet_job_status` (`job`, `status`),
+    KEY `idx_drs_job_fleet_job_garage` (`job`, `garage`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `drs_job_fleet_operations` (
+    `operation_id` VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    `external_request_id` VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    `action` VARCHAR(32) NOT NULL,
+    `status` VARCHAR(16) NOT NULL DEFAULT 'pending',
+    `vehicle_row_id` VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    `plate` VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    `job` VARCHAR(50) NOT NULL,
+    `model` VARCHAR(64) NULL,
+    `garage_from` VARCHAR(50) NULL,
+    `garage_to` VARCHAR(50) NULL,
+    `min_grade` INT UNSIGNED NULL,
+    `actor_source` INT UNSIGNED NOT NULL DEFAULT 0,
+    `actor_identifier` VARCHAR(80) NOT NULL,
+    `actor_name` VARCHAR(100) NOT NULL,
+    `actor_job` VARCHAR(50) NULL,
+    `actor_grade` INT NOT NULL DEFAULT 0,
+    `source_resource` VARCHAR(64) NOT NULL DEFAULT 'drs_garages',
+    `reason` VARCHAR(500) NULL,
+    `vehicle_snapshot` LONGTEXT NULL,
+    `request_json` LONGTEXT NULL,
+    `error_code` VARCHAR(100) NULL,
+    `error_detail` VARCHAR(500) NULL,
+    `created_at` BIGINT UNSIGNED NOT NULL,
+    `updated_at` BIGINT UNSIGNED NOT NULL,
+    `completed_at` BIGINT UNSIGNED NULL,
+    PRIMARY KEY (`operation_id`),
+    UNIQUE KEY `ux_drs_job_fleet_external_request` (`source_resource`, `external_request_id`),
+    KEY `idx_drs_job_fleet_operations_plate` (`plate`, `created_at`),
+    KEY `idx_drs_job_fleet_operations_job` (`job`, `created_at`),
+    KEY `idx_drs_job_fleet_operations_status` (`status`, `created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

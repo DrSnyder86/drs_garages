@@ -56,6 +56,8 @@
         sortImpoundedAsc: "Oldest impounded",
         sortFeeDesc: "Fee: High–low",
         sortFeeAsc: "Fee: Low–high",
+        manageFleet: "Manage fleet",
+        fleetMinGrade: "Grade %s+",
     });
 
     const state = {
@@ -68,6 +70,7 @@
         mode: "garage",
         activeScope: null,
         scopes: [],
+        canManageFleet: false,
         vehicles: [],
         imageSourceLabel: "",
         error: "",
@@ -207,6 +210,10 @@
             engine: clampPercent(source.engine),
             body: clampPercent(source.body),
             classLabel: asText(source.classLabel),
+            fleetMinGrade: Number.isFinite(Number(source.fleetMinGrade))
+                ? Math.max(0, Math.floor(Number(source.fleetMinGrade)))
+                : null,
+            fleetManaged: Boolean(source.fleetManaged),
             imageCandidates,
             actionLabel: asText(source.actionLabel, defaultActionLabel(actionKind)),
             actionKind,
@@ -240,6 +247,7 @@
             state.mode = "garage";
             state.activeScope = null;
             state.scopes = [];
+            state.canManageFleet = false;
             state.vehicles = [];
             state.imageSourceLabel = "";
             state.error = "";
@@ -253,6 +261,7 @@
         if (hasOwn(payload, "subtitle")) state.subtitle = asText(payload.subtitle, "Select a vehicle");
         if (hasOwn(payload, "mode")) state.mode = payload.mode === "impound" ? "impound" : "garage";
         if (hasOwn(payload, "activeScope")) state.activeScope = payload.activeScope;
+        if (hasOwn(payload, "canManageFleet")) state.canManageFleet = Boolean(payload.canManageFleet);
         if (hasOwn(payload, "scopes")) {
             state.scopes = Array.isArray(payload.scopes) ? payload.scopes.map(normalizeScope) : [];
         }
@@ -418,6 +427,14 @@
             fragment.append(button);
         });
 
+        if (state.mode === "garage" && state.canManageFleet && String(state.activeScope) === "society") {
+            const manage = createElement("button", "scope-tab fleet-action", state.labels.manageFleet);
+            manage.type = "button";
+            manage.disabled = state.busy;
+            manage.addEventListener("click", requestFleetManager);
+            fragment.append(manage);
+        }
+
         scopeTabs.replaceChildren(fragment);
         scopeTabs.classList.toggle("is-hidden", state.scopes.length < 2);
     };
@@ -523,6 +540,14 @@
         if (vehicle.classLabel) {
             meta.append(createElement("span", "meta-divider"));
             meta.append(createElement("span", "vehicle-class", vehicle.classLabel));
+        }
+        if (vehicle.fleetManaged && vehicle.fleetMinGrade !== null) {
+            meta.append(createElement("span", "meta-divider"));
+            meta.append(createElement(
+                "span",
+                "fleet-grade",
+                state.labels.fleetMinGrade.replace("%s", String(vehicle.fleetMinGrade)),
+            ));
         }
 
         let impoundDetails = null;
@@ -709,6 +734,14 @@
             state.activeScope = previousScope;
             renderScopes();
             setBusy(false);
+        });
+    };
+
+    const requestFleetManager = () => {
+        if (!state.open || state.busy || !state.canManageFleet || String(state.activeScope) !== "society") return;
+        setBusy(true, "Opening Fleet Manager…");
+        postNui("fleet", { sessionId: state.sessionId }).catch(() => {
+            if (state.open) setBusy(false);
         });
     };
 

@@ -155,5 +155,8 @@
     "garage_ui_sort_fee_desc": "Poplatek: Od nejvyššího",
     "garage_ui_sort_fee_asc": "Poplatek: Od nejnižšího",
     "garage_ui_unavailable": "Rozhraní garáže není dostupné. Zkuste to znovu nebo povolte záložní kontextovou nabídku.",
+    "fleet_manager": "Spravovat vozový park",
+    "fleet_manager_desc": "Přiřazujte, vydávejte, přesouvejte, nakupujte nebo vyřazujte služební vozidla.",
+    "fleet_min_grade": "Hodnost %s+",
     "contract_vehicle_label": "vozidlo s SPZ %s"
 }

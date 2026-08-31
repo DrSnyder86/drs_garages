@@ -1,13 +1,14 @@
-# Upgrade to 2.5.0-drs.1
+# Upgrade to 2.6.0-drs.1
 
 This release is designed for a non-destructive upgrade, but it tightens the
 database contract and runtime validation. Complete the checks below before
 opening the server to players.
 
-Upgrading from `2.4.0-drs.2` requires no SQL migration. Version 2.5 adds nearby
-garage radial access, vehicle-target parking, and a shared five-second parking
-progress. Merge the new `Config.RadialMenu` and `Config.Parking` blocks instead
-of overwriting local configuration changes.
+Upgrading from `2.5.0-drs.1` adds three DRS-owned tables: the Contract V2
+operation journal plus job-fleet metadata and operation journals. They are
+created automatically when migrations are enabled. Merge `Config.JobFleet`, the
+new Contract V2 action/policy fields, and stable IDs/Jobs for every fleet garage
+instead of overwriting local configuration changes.
 
 Upgrading from 2.3 requires no new database migration. Version 2.4 changes the
 impound UI and runtime removal lifecycle; keep the normal backup and doctor
@@ -140,6 +141,17 @@ the block missing or `Enabled` not set to `true` leaves unrecorded local-vehicle
 removal disabled. Population types 1-5 are GTA's natural traffic/parked groups;
 DRS always rejects mission and script vehicles.
 
+Merge `Config.JobFleet` from the new release. Keep `BossCanCreate = false` when
+bosses should use paid society purchasing, set exact job names on each fleet
+garage, give those garages stable `Garage` IDs, and explicitly allow every model
+under `AllowedModels`. The included MRPD entry is `mrpd_fleet` for `police`.
+
+Contract V2 ships with only `SocietyDonations = true`; player sales and society
+withdrawals are false. Do not copy the old
+`SocietyWithdrawalRequiresBoss` flag forward. Use
+`SocietyWithdrawalPermission = 'admin'` and install the inventory item using
+[`install/ContractItem.md`](install/ContractItem.md).
+
 Stock ESX does not expose one universal duty flag, so DRS treats the current ESX
 job as active when neither `onduty` nor `onDuty` exists. Custom duty values are
 honored when present; set `RequireDuty = false` to ignore them deliberately.
@@ -199,6 +211,11 @@ audit details, and timestamps out of the framework-owned vehicle table.
 The framework vehicle table and `drs_vehicle_impounds` must both use InnoDB so
 their cross-table state changes can commit or roll back together.
 
+When automatic migration is disabled, also import
+[`sql/drs_vehicle_contract_operations.sql`](sql/drs_vehicle_contract_operations.sql)
+and [`sql/drs_job_fleet.sql`](sql/drs_job_fleet.sql). Preserve any existing
+journal rows; never drop an incompatible audit table merely to make startup pass.
+
 Do not run `sql/repair_qbox_vehicle_storage_state.sql` as part of a routine
 upgrade. It changes out/stored state and is provided only for an intentionally
 reviewed repair after a backup. It must be run offline with the FiveM server
@@ -217,6 +234,12 @@ ensure qbx_vehicles
 ensure qbx_vehiclekeys
 ensure ox_inventory
 ensure ox_target
+
+# Choose one for paid society fleet purchases:
+# Renewed-Banking works on pure Qbox but Doctor warns that its balance write is asynchronous.
+ensure Renewed-Banking
+# qb-banking is preferred when supported because its balance mutation result is awaited.
+# ensure qb-banking
 
 # Only when selected qbx_properties interiors require it:
 ensure bob74_ipl
@@ -245,6 +268,8 @@ For in-game administrators:
 
 ```cfg
 add_ace group.admin command.drsgarages:doctor allow
+add_ace group.admin drs_garages.contract.admin allow
+add_ace group.admin drs_garages.fleet.admin allow
 ```
 
 Run `/drsgarages:doctor` and inspect the full F8 report. Resolve every FAIL.
@@ -294,14 +319,15 @@ Use test characters and inexpensive vehicles first.
 - Target disabled/stopped: restart `drs_garages`, then confirm locations use
   TextUI at `Position` or the `PedPosition` coordinates and the doctor reports
   the fallback warning.
-- Vehicle contracts are disabled by default because their framework-side money,
-  inventory, and ownership effects are not one crash-durable transaction. If
-  you explicitly enable them, test with `Config.Contract.VehicleDistance = 5.0`:
-  confirm an active vehicle inside that radius succeeds, while one beyond the
-  additional `2.0`-metre server tolerance is rejected.
-- Society withdrawal: with the default
-  `Config.Contract.SocietyWithdrawalRequiresBoss = true`, confirm the current
-  matching-job boss can privatize the vehicle and a non-boss cannot.
+- Contract V2: use the installed contract item to donate a personal test vehicle
+  as the current job boss. Confirm a non-boss is denied, disabled sale/withdrawal
+  actions do not appear, and `drsgarages:contracts` reports no unresolved work.
+- Fleet Manager: donate a test vehicle, move it, set a grade requirement, verify
+  a lower-grade employee cannot list/take out/recover/locate it, then retire a
+  disposable stored asset. Test one ACE-admin free issuance separately.
+- Paid society fleet purchase: fund the configured account and confirm one boss
+  purchase creates exactly one debit, shop order, DRS fleet operation, and
+  stored job vehicle. A missing banking provider must fail before any debit.
 
 ## Rollback
 

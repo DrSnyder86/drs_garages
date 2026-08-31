@@ -1,78 +1,149 @@
 if type(Config.Contract) ~= 'table' or Config.Contract.Enabled ~= true then return end
 
-lib.callback.register('drs_garages:getContractOption', function()
-    if cache.vehicle then
+local function finiteNumber(value, fallback)
+    value = tonumber(value)
+    if not value or value ~= value or value == math.huge or value == -math.huge then return fallback end
+    return value
+end
+
+local function resolveOnce(pending)
+    local settled = false
+
+    return function(...)
+        if settled then return end
+        settled = true
+        pending:resolve(...)
+    end
+end
+
+lib.callback.register('drs_garages:getContractVehicle', function()
+    local ped = cache.ped or PlayerPedId()
+    if cache.vehicle or IsPedInAnyVehicle(ped, false) then
         ShowNotification(locale('cant_in_vehicle'), 'error')
         return
     end
 
-    local vehicle = lib.getClosestVehicle(cache.coords, 3.0, false)
+    local distance = math.min(math.max(finiteNumber(Config.Contract.VehicleDistance, 5.0), 1.0), 25.0)
+    local vehicle = lib.getClosestVehicle(GetEntityCoords(ped), distance, false)
 
     if not vehicle then
         ShowNotification(locale('no_vehicle_near_you'), 'error')
-        return 
+        return
     end
 
-    local plate = GetVehicleNumberPlateText(vehicle)
-    local label = GetVehicleLabel(GetEntityModel(vehicle))
-    local option = promise.new()
-
-    local function Resolve(name)
-        option:resolve(name)
-    end
-
-    lib.registerContext({
-        id = 'contract',
-        title = locale('contract'),
-        onClose = function()
-            option:resolve()
-        end,
-        options = {
-            {
-                title = locale('transfer_player'),
-                icon = 'user',
-                args = 'transfer_player',
-                onSelect = Resolve
-            },
-            {
-                title = locale('transfer_society'),
-                icon = 'users',
-                args = 'transfer_society',
-                onSelect = Resolve
-            },
-            {
-                title = locale('withdraw_society'),
-                icon = 'rotate-left',
-                args = 'withdraw_society',
-                onSelect = Resolve
-            }
-        }
-    })
-
-    lib.showContext('contract')
-
-    return Citizen.Await(option), plate, label
+    return GetVehicleNumberPlateText(vehicle), GetVehicleLabel(GetEntityModel(vehicle))
 end)
 
+lib.callback.register('drs_garages:chooseContractOption', function(eligibility)
+    if type(eligibility) ~= 'table' then return end
+
+    local options = {}
+    if eligibility.playerSale == true then
+        options[#options + 1] = {
+            title = locale('transfer_player'),
+            icon = 'user',
+            args = 'transfer_player'
+        }
+    end
+    if eligibility.societyDonation == true then
+        options[#options + 1] = {
+            title = locale('transfer_society'),
+            icon = 'users',
+            args = 'transfer_society'
+        }
+    end
+    if eligibility.societyWithdrawal == true then
+        options[#options + 1] = {
+            title = locale('withdraw_society'),
+            icon = 'rotate-left',
+            args = 'withdraw_society'
+        }
+    end
+
+    if #options == 0 then
+        ShowNotification(locale('contract_failed'), 'error')
+        return
+    end
+
+    local pending = promise.new()
+    local resolve = resolveOnce(pending)
+    for i = 1, #options do options[i].onSelect = resolve end
+
+    lib.registerContext({
+        id = 'drs_garages_contract',
+        title = locale('contract'),
+        onClose = resolve,
+        options = options
+    })
+    lib.showContext('drs_garages_contract')
+
+    return Citizen.Await(pending)
+end)
+
+local function chooseNearbyPlayer()
+    local maximumDistance = math.min(math.max(finiteNumber(Config.Contract.PlayerDistance, 10.0), 1.0), 25.0)
+    local ped = cache.ped or PlayerPedId()
+    local nearbyPlayers = lib.getNearbyPlayers(GetEntityCoords(ped), maximumDistance, false)
+    local options = {}
+
+    for i = 1, #nearbyPlayers do
+        local playerId = nearbyPlayers[i].id
+        local serverId = GetPlayerServerId(playerId)
+
+        if serverId and serverId > 0 then
+            options[#options + 1] = {
+                title = ('%s [%s]'):format(GetPlayerName(playerId) or 'Player', serverId),
+                icon = 'user',
+                args = serverId
+            }
+        end
+    end
+
+    table.sort(options, function(left, right)
+        return tonumber(left.args) < tonumber(right.args)
+    end)
+
+    if #options == 0 then
+        ShowNotification('No nearby players were found.', 'error')
+        return
+    end
+
+    local pending = promise.new()
+    local resolve = resolveOnce(pending)
+    for i = 1, #options do options[i].onSelect = resolve end
+
+    lib.registerContext({
+        id = 'drs_garages_contract_player',
+        title = locale('pick_player'),
+        onClose = resolve,
+        options = options
+    })
+    lib.showContext('drs_garages_contract_player')
+
+    return Citizen.Await(pending)
+end
+
 lib.callback.register('drs_garages:getTargetPlayer', function()
+    local targetId = chooseNearbyPlayer()
+    if not targetId then return end
+
+    local minimum = math.max(0, math.floor(finiteNumber(Config.Contract.MinimumPrice or Config.Contract.MinPrice, 0)))
+    local maximum = math.max(minimum, math.floor(finiteNumber(
+        Config.Contract.MaximumPrice or Config.Contract.MaxPrice,
+        100000000
+    )))
     local input = lib.inputDialog(locale('pick_player'), {
-        {
-            type = 'number',
-            label = locale('player_id'),
-            required = true,
-            min = 1
-        },
         {
             type = 'number',
             label = locale('sell_price'),
             required = true,
-            min = 0
+            min = minimum,
+            max = maximum
         }
     })
 
     if not input then return end
-
-    return tonumber(input[1]), tonumber(input[2])
+    return tonumber(targetId), tonumber(input[1])
 end)
 
 lib.callback.register('drs_garages:getAgreement', function(price, label, name)
@@ -97,25 +168,40 @@ lib.callback.register('drs_garages:societyPrompt', function(type)
         centered = true,
         labels = {
             confirm = locale('society_confirm'),
-            cancel = locale('society_cancel'),
+            cancel = locale('society_cancel')
         }
     })
 
     return result == 'confirm'
 end)
 
+local function signingDuration()
+    return math.min(math.max(math.floor(finiteNumber(Config.Contract.Duration, 5000)), 250), 60000)
+end
+
+lib.callback.register('drs_garages:signContract', function(message)
+    return lib.progressBar({
+        label = tostring(message or locale('contract')),
+        duration = signingDuration(),
+        canCancel = true,
+        disable = {
+            move = true,
+            car = true,
+            combat = true
+        },
+        anim = {
+            scenario = 'WORLD_HUMAN_CLIPBOARD'
+        }
+    }) == true
+end)
+
+-- Kept for compatibility with companion resources that used the V1 cosmetic
+-- animation event. Contract V2 itself signs through the callback above before
+-- any item, money, or ownership mutation occurs.
 RegisterNetEvent('drs_garages:contractAnim', function(message)
-    local duration = tonumber(Config.Contract and Config.Contract.Duration) or 5000
-
-    if duration ~= duration or duration == math.huge or duration == -math.huge then
-        duration = 5000
-    end
-
-    duration = math.min(math.max(math.floor(duration), 250), 60000)
-
     lib.progressBar({
         label = message,
-        duration = duration,
+        duration = signingDuration(),
         canCancel = false,
         disable = {
             move = true,

@@ -276,6 +276,18 @@ select:focus-visible {
     color: var(--accent);
 }
 
+.scope-tab.fleet-action {
+    border-color: rgba(78, 255, 167, 0.2);
+    background: rgba(78, 255, 167, 0.07);
+    color: var(--accent);
+}
+
+.scope-tab.fleet-action::before {
+    content: "+";
+    margin-right: 6px;
+    font-weight: 800;
+}
+
 .scope-tab:disabled {
     cursor: wait;
     opacity: 0.55;
@@ -667,6 +679,15 @@ kbd {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.fleet-grade {
+    flex: 0 0 auto;
+    color: var(--accent);
+    font-size: 0.62rem;
+    font-weight: 700;
+    letter-spacing: 0.025em;
     white-space: nowrap;
 }
 

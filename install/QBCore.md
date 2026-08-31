@@ -101,15 +101,15 @@ switching target providers.
 
 ## Contract item
 
-Contracts are disabled by default because QB money, inventory, ownership, and
-key persistence do not expose one atomic, crash-durable transfer. Leave
-`Config.Contract.Enabled = false` unless you have reviewed that operational
-limitation. Stock `qb-vehiclekeys` also has no global offline plate-key reset,
-so ownership-domain contracts must remain disabled when it is the active key
-resource.
+Contract V2 is enabled with only boss society donations active. Player sales and
+society withdrawals are separate opt-ins, and every operation is journaled for
+startup recovery. Stock `qb-vehiclekeys` has no safe global/offline plate-key
+reset, so DRS deliberately blocks contract item registration while that key
+combination is active. Disable the DRS key integration or use a compatible key
+resource before enabling ownership-domain contracts.
 
-When `Config.Contract.Enabled = true`, add the item named by
-`Config.Contract.Item` to `qb-core/shared/items.lua`. The default is:
+Add the item named by `Config.Contract.Item` to `qb-core/shared/items.lua` (or
+follow [`ContractItem.md`](ContractItem.md) for ox_inventory). The default is:
 
 ```lua
 contract = {
@@ -131,8 +131,8 @@ Add the matching inventory image when your inventory UI requires it.
 Contract vehicle validation uses `Config.Contract.VehicleDistance = 5.0` by
 default, plus the server's standard `2.0`-metre network tolerance, for a default
 effective upper bound of `7.0` metres from the active vehicle.
-`Config.Contract.SocietyWithdrawalRequiresBoss = true` permits only a current
-boss of the matching job to privatize a society vehicle.
+The supplied `SocietyWithdrawalPermission = 'admin'` requires the
+`drs_garages.contract.admin` ACE if that action is enabled.
 
 ## Verify
 
@@ -140,6 +140,8 @@ After startup, run `drsgarages:doctor` in the server console. For in-game use:
 
 ```cfg
 add_ace group.admin command.drsgarages:doctor allow
+add_ace group.admin drs_garages.contract.admin allow
+add_ace group.admin drs_garages.fleet.admin allow
 ```
 
 Test parking, takeout, restart persistence, and impound for each enabled vehicle

@@ -29,6 +29,13 @@ ensure qbx_vehiclekeys
 ensure ox_inventory
 ensure ox_target
 
+# Choose one when paid society fleet purchases are enabled. Renewed-Banking is
+# native to pure Qbox, but Doctor warns that its current balance write is async:
+ensure Renewed-Banking
+# qb-banking is preferred when your framework stack supports it because its
+# mutation export returns an awaited database result.
+# ensure qb-banking
+
 # Only when selected qbx_properties interiors require it:
 ensure bob74_ipl
 
@@ -58,7 +65,9 @@ With `Config.Database.AutoMigrate = true`, DRS:
 2. preserves an existing `stored` or `state` value when adding its counterpart;
 3. verifies/creates its owner/type/storage lookup indexes;
 4. checks for duplicate trimmed, case-normalized plate values; and
-5. verifies/creates one UNIQUE index over the complete `plate` column.
+5. verifies/creates one UNIQUE index over the complete `plate` column; and
+6. creates/validates the DRS impound, Contract V2, and job-fleet metadata and
+   operation-journal tables.
 
 At least one of `stored` or `state` must already exist as the authoritative
 source. If both are absent, DRS stops instead of guessing every vehicle's
@@ -119,18 +128,35 @@ switching target providers.
 
 ## Contract safeguards
 
-Contracts are disabled by default because framework money, inventory, and
-ownership calls cannot be committed as one atomic, crash-durable transaction.
-Enable `Config.Contract.Enabled` only after accepting that a process crash
-during a transfer can require administrator reconciliation. When enabled, DRS
-uses the official Qbox ownership hook and rotates the Qbox vehicle session id
-to invalidate previously persisted explicit keys.
+Contract V2 is enabled with only boss-to-society donation active. Player sales
+and society withdrawals are separate opt-ins. Install the external inventory
+item using [`ContractItem.md`](ContractItem.md); the doctor warns when the
+configured `contract` item is absent. DRS uses the official Qbox ownership hook,
+rotates the vehicle session id to invalidate prior explicit keys, and records
+each transfer in `drs_vehicle_contract_operations` for restart reconciliation.
 
 `Config.Contract.VehicleDistance` defaults to `5.0` metres, with the server's
 standard `2.0`-metre network tolerance applied during validation. The default
 effective upper bound is therefore `7.0` metres from the active vehicle.
-`Config.Contract.SocietyWithdrawalRequiresBoss = true` permits only a current
-boss of the matching job to privatize a society vehicle.
+The supplied `SocietyWithdrawalPermission = 'admin'` remains in force if the
+withdrawal action is enabled. Use `drsgarages:contracts` to inspect unresolved
+operations before manually resolving one.
+
+## Job fleet and society purchasing
+
+The MRPD job garage has the stable ID `mrpd_fleet`. Current-job bosses can open
+Fleet Manager from the Society tab or `/jobfleet`, donate personal vehicles,
+set minimum grades, move stored fleet assets, and retire them. ACE administrators
+can also issue models from `Config.JobFleet.AllowedModels`; boss free issuance
+is disabled by default.
+
+Paid society purchasing requires Qbox, `qbx_vehicles`, the matching
+`drs_vehicleshop` fleet configuration, and Renewed Banking or QB Banking. The
+Doctor reports Renewed's current asynchronous persistence acknowledgement as a
+best-effort warning; QB Banking provides an awaited mutation result. The
+shop resolves the model/price and journals the society debit; DRS independently
+validates the boss/job/garage/model and journals the stored fleet creation.
+Ambiguous results stop for staff review.
 
 ## Verify the trio
 
@@ -139,6 +165,8 @@ allow an administrator to run `/drsgarages:doctor` in game:
 
 ```cfg
 add_ace group.admin command.drsgarages:doctor allow
+add_ace group.admin drs_garages.contract.admin allow
+add_ace group.admin drs_garages.fleet.admin allow
 ```
 
 Before opening the server, verify:
@@ -148,5 +176,9 @@ Before opening the server, verify:
 3. a property garage works for its owner and keyholder but not a stranger;
 4. a sold property removes access and its assigned vehicle follows the selected
    recovery policy; and
-5. a purchased shop vehicle receives keys, uses the configured garage, and
-   remains consistent after restart.
+5. a purchased personal shop vehicle receives keys, uses the configured garage,
+   and remains consistent after restart;
+6. a boss can donate, grade, move, and retrieve a managed police vehicle while a
+   lower grade cannot use it; and
+7. one paid society purchase creates exactly one debit, shop journal row, fleet
+   operation, and stored job vehicle.

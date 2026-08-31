@@ -155,5 +155,8 @@
     "garage_ui_sort_fee_desc": "Fee: High–low",
     "garage_ui_sort_fee_asc": "Fee: Low–high",
     "garage_ui_unavailable": "The garage interface is not available. Try again or enable the context-menu fallback.",
+    "fleet_manager": "Manage fleet",
+    "fleet_manager_desc": "Assign, issue, move, grade, purchase, or retire job vehicles.",
+    "fleet_min_grade": "Grade %s+",
     "contract_vehicle_label": "vehicle with plate %s"
 }
